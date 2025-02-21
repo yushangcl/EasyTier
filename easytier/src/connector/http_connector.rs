@@ -12,7 +12,7 @@ use crate::{
     common::{error::Error, global_ctx::ArcGlobalCtx},
     tunnel::{Tunnel, TunnelConnector, TunnelError, ZCPacketSink, ZCPacketStream},
 };
-
+use crate::connector::dns_txt_connector::DNSTxtTunnelConnector;
 use crate::proto::common::TunnelInfo;
 
 use super::create_connector_by_url;
@@ -187,10 +187,23 @@ impl HttpTunnelConnector {
 #[async_trait::async_trait]
 impl super::TunnelConnector for HttpTunnelConnector {
     async fn connect(&mut self) -> Result<Box<dyn Tunnel>, TunnelError> {
-        let mut conn = self
+        let mut conn: Box<dyn TunnelConnector> = match self
             .get_redirected_connector(self.addr.to_string().as_str())
             .await
-            .with_context(|| "get redirected url failed")?;
+        {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::warn!("http or https the request failed: {:?}, try TXT alternate scenarios", e);
+                // 构造 TXT URL 作为备用方案
+                let mut txt_url = self.addr.clone().to_string().as_str().replace("http", "txt").replace("https", "txt");
+                let url = url::Url::parse(&txt_url).map_err(|_| TunnelError::InvalidAddr(txt_url.to_owned()))?;
+                // 尝试备用连接
+               Box::new(DNSTxtTunnelConnector::new(
+                    url,
+                    self.global_ctx.clone(),
+                ))
+            }
+        };
         let t = conn.connect().await?;
         let info = t.info().unwrap_or_default();
         Ok(Box::new(TunnelWithInfo::new(

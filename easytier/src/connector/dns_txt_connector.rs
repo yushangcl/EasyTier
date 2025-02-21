@@ -95,11 +95,12 @@ impl DNSTxtTunnelConnector {
 
         let resolver = AsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default()).map_err(|_| Error::InvalidUrl("Failed to create an asynchronous dns resolver".to_string()))?;
 
-        let txt_records = resolver.txt_lookup(original_url.replace("txt://", "")).await
+        let txt_records = resolver.txt_lookup(original_url.replace("txt://", "").replace("/","")).await
             .map_err(|_| Error::InvalidUrl("failed to get txt records".to_string()))?;
 
         if let Some(txt_record) = txt_records.iter().next() {
             let txt_str = txt_record.to_string();
+            tracing::info!("get_txt_record_url succ: {}", txt_str);
 
             let new_url = url::Url::parse(txt_str.as_str())
                 .with_context(|| format!("parsing redirect url failed. url: {}", txt_str))?;
