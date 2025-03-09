@@ -1,14 +1,8 @@
-use std::{
-    net::SocketAddr,
-    pin::Pin,
-    sync::{Arc, RwLock},
-};
+use std::{net::SocketAddr, sync::Arc};
 
 use crate::{
     common::{error::Error, global_ctx::ArcGlobalCtx},
-    tunnel::{
-        Tunnel, TunnelConnector, TunnelError, ZCPacketSink, ZCPacketStream, PROTO_PORT_OFFSET,
-    },
+    tunnel::{Tunnel, TunnelConnector, TunnelError, PROTO_PORT_OFFSET},
 };
 use anyhow::Context;
 use dashmap::DashSet;
@@ -249,8 +243,7 @@ impl super::TunnelConnector for DNSTunnelConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::global_ctx::{tests::get_mock_global_ctx, GlobalCtx};
-    use std::sync::Arc;
+    use crate::common::global_ctx::tests::get_mock_global_ctx;
 
     #[tokio::test]
     async fn test_txt() {
