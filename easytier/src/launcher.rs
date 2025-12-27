@@ -224,7 +224,7 @@ impl EasyTierLauncher {
             let notifier = data.instance_stop_notifier.clone();
             let ret = rt.block_on(Self::easytier_routine(
                 cfg,
-                stop_notifier.clone(),
+                stop_notifier,
                 api_service,
                 data,
             ));
@@ -792,7 +792,7 @@ impl NetworkConfig {
 
         let network_identity = config.get_network_identity();
         result.network_name = Some(network_identity.network_name.clone());
-        result.network_secret = network_identity.network_secret.clone();
+        result.network_secret = network_identity.network_secret;
 
         if let Some(ipv4) = config.get_ipv4() {
             result.virtual_ipv4 = Some(ipv4.address().to_string());
@@ -904,13 +904,19 @@ impl NetworkConfig {
         result.mtu = Some(flags.mtu as i32);
         result.enable_private_mode = Some(flags.private_mode);
 
-        if !flags.relay_network_whitelist.is_empty() && flags.relay_network_whitelist != "*" {
+        if flags.relay_network_whitelist == "*" {
+            result.enable_relay_network_whitelist = Some(false);
+        } else {
             result.enable_relay_network_whitelist = Some(true);
-            result.relay_network_whitelist = flags
-                .relay_network_whitelist
-                .split_whitespace()
-                .map(|s| s.to_string())
-                .collect();
+            if flags.relay_network_whitelist.is_empty() {
+                result.relay_network_whitelist = vec![];
+            } else {
+                result.relay_network_whitelist = flags
+                    .relay_network_whitelist
+                    .split_whitespace()
+                    .map(|s| s.to_string())
+                    .collect();
+            }
         }
 
         Ok(result)
