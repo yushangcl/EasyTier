@@ -85,7 +85,7 @@ impl UdpNatEntry {
 
     async fn compose_ipv4_packet(
         self: &Arc<Self>,
-        packet_sender: &mut Sender<ZCPacket>,
+        packet_sender: &Sender<ZCPacket>,
         buf: &mut [u8],
         src_v4: &SocketAddrV4,
         payload_len: usize,
@@ -139,7 +139,7 @@ impl UdpNatEntry {
 
     async fn forward_task(
         self: Arc<Self>,
-        mut packet_sender: Sender<ZCPacket>,
+        packet_sender: Sender<ZCPacket>,
         virtual_ipv4: Ipv4Addr,
         real_ipv4: Ipv4Addr,
         mapped_ipv4: Ipv4Addr,
@@ -207,7 +207,7 @@ impl UdpNatEntry {
 
                 let Ok(_) = Self::compose_ipv4_packet(
                     &self_clone,
-                    &mut packet_sender,
+                    &packet_sender,
                     &mut packet,
                     &src_v4,
                     len,
@@ -298,6 +298,30 @@ impl UdpProxy {
             udp::UdpPacket::new(ipv4.payload())?
         };
 
+        // TODO: should it be async.
+        let dst_socket = if Some(ipv4.get_destination())
+            == self.global_ctx.get_ipv4().as_ref().map(Ipv4Inet::address)
+        {
+            if self
+                .global_ctx
+                .is_port_in_running_listeners(udp_packet.get_destination(), true)
+                && self
+                    .global_ctx
+                    .is_ip_in_same_network(&std::net::IpAddr::V4(ipv4.get_source()))
+            {
+                tracing::debug!(
+                    dst_port = udp_packet.get_destination(),
+                    "dst socket is in running listeners, ignore it"
+                );
+                return Some(());
+            }
+            format!("127.0.0.1:{}", udp_packet.get_destination())
+                .parse()
+                .unwrap()
+        } else {
+            SocketAddr::new(real_dst_ip.into(), udp_packet.get_destination())
+        };
+
         tracing::trace!(
             ?packet,
             ?ipv4,
@@ -338,17 +362,6 @@ impl UdpProxy {
         }
 
         nat_entry.mark_active();
-
-        // TODO: should it be async.
-        let dst_socket = if Some(ipv4.get_destination())
-            == self.global_ctx.get_ipv4().as_ref().map(Ipv4Inet::address)
-        {
-            format!("127.0.0.1:{}", udp_packet.get_destination())
-                .parse()
-                .unwrap()
-        } else {
-            SocketAddr::new(real_dst_ip.into(), udp_packet.get_destination())
-        };
 
         let send_ret = {
             let _g = self.global_ctx.net_ns.guard();
