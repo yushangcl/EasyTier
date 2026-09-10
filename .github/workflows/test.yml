@@ -2,12 +2,18 @@ name: EasyTier Test
 
 on:
   push:
-    branches: ["develop", "main"]
+    branches: [ "develop", "main" ]
   pull_request:
-    branches: ["develop", "main"]
+    branches: [ "develop", "main" ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+#  RUSTC_WRAPPER: "sccache"
+#  SCCACHE_GHA_ENABLED: "true"
 
 defaults:
   run:
@@ -16,85 +22,63 @@ defaults:
 
 jobs:
   pre_job:
-    # continue-on-error: true # Uncomment once integration is finished
     runs-on: ubuntu-latest
-    # Map a step output to a job output
+    env:
+      RELEVANT_PATHS: >-
+        ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/**",
+        "pnpm-lock.yaml", "pnpm-workspace.yaml", "package.json", "easytier/**",
+        "easytier-core/**", "easytier-proto/**", "easytier-rpc-build/**",
+        "easytier-web/**", "easytier-gui/src-tauri/**",
+        "tauri-plugin-vpnservice/**", "easytier-contrib/**",
+        ".github/workflows/test.yml", ".github/actions/**"]
     outputs:
-      should_skip: ${{ steps.skip_check.outputs.should_skip }}
+      should_skip: >-
+        ${{
+          steps.skip_check.outputs.should_skip == 'true' ||
+          (
+            github.event_name == 'pull_request' &&
+            steps.path_filter.outputs.relevant != 'true'
+          )
+        }}
     steps:
       - id: skip_check
         uses: fkirc/skip-duplicate-actions@v5
         with:
-          # All of these options are optional, so you can remove them if you are happy with the defaults
           concurrent_skipping: 'never'
           skip_after_successful_duplicate: 'true'
-          paths: '["Cargo.toml", "Cargo.lock", "easytier/**", ".github/workflows/test.yml", ".github/workflows/install_gui_dep.sh", ".github/workflows/install_rust.sh"]'
-  test:
-    runs-on: ubuntu-22.04
+          paths: ${{ env.RELEVANT_PATHS }}
+
+      - id: path_filter
+        if: >-
+          github.event_name == 'pull_request' &&
+          steps.skip_check.outputs.should_skip != 'true'
+        uses: dorny/paths-filter@v4
+        with:
+          filters: |
+            relevant: ${{ env.RELEVANT_PATHS }}
+
+  check:
+    name: Run linters & check
+    runs-on: ubuntu-latest
     needs: pre_job
-    if: needs.pre_job.outputs.should_skip != 'true'    
+    if: needs.pre_job.outputs.should_skip != 'true'
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v5
 
-      - name: Setup protoc
-        uses: arduino/setup-protoc@v3
+      - name: Prepare build environment
+        uses: ./.github/actions/prepare-build
         with:
-          # GitHub repo token to use to avoid rate limiter
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          gui: true
+          pnpm: true
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Setup tools for test
-        run: sudo apt install bridge-utils
-
-      - name: Setup system for test
-        run: |
-          sudo modprobe br_netfilter
-          sudo sysctl net.bridge.bridge-nf-call-iptables=0
-          sudo sysctl net.bridge.bridge-nf-call-ip6tables=0
-          sudo sysctl net.ipv6.conf.lo.disable_ipv6=0
-          sudo ip addr add 2001:db8::2/64 dev lo
-
-      - uses: actions/setup-node@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          node-version: 22
+          components: rustfmt,clippy
+          target: wasm32-wasip1
+          rustflags: ''
 
-      - name: Install pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 10
-          run_install: false
-
-      - name: Get pnpm store directory
-        shell: bash
-        run: |
-          echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
-
-      - name: Setup pnpm cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.STORE_PATH }}
-          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
-          restore-keys: |
-            ${{ runner.os }}-pnpm-store-
-
-      - name: Install frontend dependencies
-        run: |
-          pnpm -r install
-          pnpm -r --filter "./easytier-web/*"  build
-
-      - name: Cargo cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo
-            ./target
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Install GUI dependencies (Used by clippy)
-        run: |
-          bash ./.github/workflows/install_gui_dep.sh
-          bash ./.github/workflows/install_rust.sh
-          rustup component add rustfmt
-          rustup component add clippy
+      - uses: taiki-e/install-action@cargo-hack
 
       - name: Check formatting
         if: ${{ !cancelled() }}
@@ -102,14 +86,114 @@ jobs:
 
       - name: Check Clippy
         if: ${{ !cancelled() }}
-        # NOTE: tauri need `dist` dir in build.rs
+        run: cargo clippy --all-targets --features full --all -- -D warnings
+
+      - name: Check features
+        if: ${{ !cancelled() }}
+        run: cargo hack check --package easytier --each-feature --exclude-features macos-ne --verbose
+
+      - name: Check WASI
+        if: ${{ !cancelled() }}
+        run: >-
+          cargo check --package easytier-core --lib --target wasm32-wasip1
+          --features management-rpc,proxy-smoltcp-stack,ring-crypto,wasi-crypto-offload
+
+      - name: Check Cargo.lock is up to date
+        if: ${{ !cancelled() }}
         run: |
-          mkdir -p easytier-gui/dist
-          cargo clippy --all-targets --all-features --all -- -D warnings
+          if ! cargo metadata --format-version 1 --locked > /dev/null; then
+            echo "::error::Cargo.lock is out of date. Run cargo generate-lockfile or cargo build locally, then commit Cargo.lock."
+            exit 1
+          fi
+
+  pre-test:
+    name: Build test
+    runs-on: ubuntu-latest
+    needs: pre_job
+    if: needs.pre_job.outputs.should_skip != 'true'
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Prepare build environment
+        uses: ./.github/actions/prepare-build
+        with:
+          gui: true
+          pnpm: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@nextest
+
+      - name: Archive test
+        run: >-
+          cargo nextest archive --archive-file tests.tar.zst
+          --package easytier --package easytier-core --features full
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: tests
+          path: tests.tar.zst
+          retention-days: 1
+
+  test_matrix:
+    name: Test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    needs: [ pre_job, pre-test ]
+    if: needs.pre_job.outputs.should_skip != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "easytier"
+            opts: "-E 'not test(tests::three_node)' --test-threads 1 --no-fail-fast"
+
+          - name: "three_node"
+            opts: "-E 'test(tests::three_node) and not test(subnet_proxy_three_node_test)' --test-threads 1 --no-fail-fast"
+
+          - name: "three_node::subnet_proxy_three_node_test"
+            opts: "-E 'test(subnet_proxy_three_node_test)' --test-threads 1 --no-fail-fast"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup tools for test
+        run: sudo apt install bridge-utils
+      - name: Setup upnpd for test
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y miniupnpd miniupnpd-iptables iptables
+
+      - name: Setup system for test
+        run: |
+          sudo modprobe br_netfilter
+          sudo modprobe tun
+          if [ ! -e /dev/net/tun ]; then
+            sudo mkdir -p /dev/net
+            sudo mknod /dev/net/tun c 10 200
+          fi
+          sudo sysctl net.bridge.bridge-nf-call-iptables=0
+          sudo sysctl net.bridge.bridge-nf-call-ip6tables=0
+          sudo sysctl net.ipv6.conf.lo.disable_ipv6=0
+          sudo ip addr add 2001:db8::2/64 dev lo
+
+      - uses: taiki-e/install-action@nextest
+
+      - name: Download tests
+        uses: actions/download-artifact@v4
+        with:
+          name: tests
 
       - name: Run tests
         run: |
           sudo prlimit --pid $$ --nofile=1048576:1048576
-          sudo -E env "PATH=$PATH" cargo test --no-default-features --features=full --verbose -- --test-threads=1
-          sudo chown -R $USER:$USER ./target
-          sudo chown -R $USER:$USER ~/.cargo
+          sudo -E env "PATH=$PATH" EASYTIER_LINUX_BPF_INTEGRATION=required \
+            cargo nextest run --archive-file tests.tar.zst ${{ matrix.opts }}
+
+  test:
+    runs-on: ubuntu-latest
+    needs: [ pre_job, check, test_matrix ]
+    if: needs.pre_job.result == 'success' && needs.pre_job.outputs.should_skip != 'true' && !cancelled()
+    steps:
+      - name: Mark result as failed
+        if: contains(needs.*.result, 'failure')
+        run: exit 1

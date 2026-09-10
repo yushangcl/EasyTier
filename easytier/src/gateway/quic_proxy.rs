@@ -1,502 +1,1265 @@
-use anyhow::Context;
-use dashmap::DashMap;
-use pnet::packet::ipv4::Ipv4Packet;
-use prost::Message as _;
-use quinn::{Endpoint, Incoming};
-use std::net::{IpAddr, Ipv4Addr};
-use std::sync::{Arc, Mutex, Weak};
-use std::{net::SocketAddr, pin::Pin};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
-use tokio::net::TcpStream;
-use tokio::task::JoinSet;
-use tokio::time::timeout;
-
-use crate::common::acl_processor::PacketInfo;
-use crate::common::config::ConfigLoader;
-use crate::common::error::Result;
-use crate::common::global_ctx::{ArcGlobalCtx, GlobalCtx};
-use crate::common::join_joinset_background;
-use crate::defer;
-use crate::gateway::kcp_proxy::{ProxyAclHandler, TcpProxyForKcpSrcTrait};
-use crate::gateway::tcp_proxy::{NatDstConnector, NatDstTcpConnector, TcpProxy};
-use crate::gateway::CidrSet;
-use crate::peers::peer_manager::PeerManager;
-use crate::proto::acl::{ChainType, Protocol};
-use crate::proto::api::instance::{
-    ListTcpProxyEntryRequest, ListTcpProxyEntryResponse, TcpProxyEntry, TcpProxyEntryState,
-    TcpProxyEntryTransportType, TcpProxyRpc,
+use super::hedge::HedgeExt;
+use crate::proto::peer_rpc::KcpConnData as QuicConnData;
+use crate::tunnel::quic::{client_config, endpoint_config, server_config};
+use anyhow::{Context, Error, anyhow, ensure};
+use atomic_refcell::AtomicRefCell;
+use bytes::{BufMut, Bytes, BytesMut};
+use derive_more::{Constructor, Deref, DerefMut, From, Into};
+use easytier_core::config::PeerId;
+use easytier_core::packet::{PacketType, TAIL_RESERVED_SIZE, ZCPacket, ZCPacketType};
+use moka::future::Cache;
+use prost::Message;
+use quinn::udp::{EcnCodepoint, RecvMeta, Transmit};
+use quinn::{
+    AsyncUdpSocket, Connection, ConnectionError, Endpoint, RecvStream, SendStream, UdpPoller,
+    WriteError, default_runtime,
 };
-use crate::proto::common::ProxyDstInfo;
-use crate::proto::rpc_types;
-use crate::proto::rpc_types::controller::BaseController;
-use crate::tunnel::packet_def::PeerManagerHeader;
-use crate::tunnel::quic::{configure_client, make_server_endpoint};
+use std::cmp::min;
+use std::io::IoSliceMut;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::pin::Pin;
+use std::ptr::copy_nonoverlapping;
+use std::sync::Arc;
+use std::task::Poll;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, Join, join};
+use tokio::select;
+use tokio::sync::Mutex;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::{Receiver, Sender, channel};
+use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::timeout;
+use tokio_util::sync::{CancellationToken, PollSender};
+use tracing::{debug, error, info, instrument, trace, warn};
 
-pub struct QUICStream {
-    endpoint: Option<quinn::Endpoint>,
-    connection: Option<quinn::Connection>,
-    sender: quinn::SendStream,
-    receiver: quinn::RecvStream,
+use easytier_core::{
+    gateway::proxy::traits::TcpProxyStream,
+    gateway::proxy::wrapped_transport::{
+        WrappedTransportAcceptedStream, WrappedTransportConnect, WrappedTransportDatagram,
+        WrappedTransportDatagramBuffer, WrappedTransportDestinationIngress, WrappedTransportEngine,
+        WrappedTransportEngineStart, WrappedTransportKind, WrappedTransportRole,
+    },
+};
+
+//region packet
+#[derive(Debug, Constructor)]
+struct QuicPacket {
+    addr: SocketAddr,
+    payload: BytesMut,
+    segment: Option<usize>,
+    ecn: Option<EcnCodepoint>,
 }
 
-impl AsyncRead for QUICStream {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        Pin::new(&mut this.receiver).poll_read(cx, buf)
-    }
+#[derive(Debug, Clone, Copy, From, Into)]
+pub struct PacketMargins {
+    pub header: usize,
+    pub trailer: usize,
 }
 
-impl AsyncWrite for QUICStream {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        let this = self.get_mut();
-        AsyncWrite::poll_write(Pin::new(&mut this.sender), cx, buf)
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        Pin::new(&mut this.sender).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        Pin::new(&mut this.sender).poll_shutdown(cx)
+impl PacketMargins {
+    pub fn len(&self) -> usize {
+        self.header + self.trailer
     }
 }
+//endregion
 
-#[derive(Debug, Clone)]
-pub struct NatDstQUICConnector {
-    pub(crate) peer_mgr: Weak<PeerManager>,
+//region socket
+#[derive(Debug)]
+struct QuicSocketPoller {
+    tx: PollSender<QuicPacket>,
 }
 
-#[async_trait::async_trait]
-impl NatDstConnector for NatDstQUICConnector {
-    type DstStream = QUICStream;
+impl UdpPoller for QuicSocketPoller {
+    fn poll_writable(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context,
+    ) -> Poll<std::io::Result<()>> {
+        let tx = &mut self.get_mut().tx;
 
-    #[tracing::instrument(skip(self), level = "debug", name = "NatDstQUICConnector::connect")]
-    async fn connect(&self, src: SocketAddr, nat_dst: SocketAddr) -> Result<Self::DstStream> {
-        let Some(peer_mgr) = self.peer_mgr.upgrade() else {
-            return Err(anyhow::anyhow!("peer manager is not available").into());
-        };
+        let poll = tx.poll_reserve(cx);
+        if let Poll::Ready(Ok(_)) = poll {
+            tx.abort_send();
+        }
 
-        let IpAddr::V4(dst_ipv4) = nat_dst.ip() else {
-            return Err(anyhow::anyhow!("src must be an IPv4 address").into());
-        };
-
-        let Some(dst_peer) = peer_mgr.get_peer_map().get_peer_id_by_ipv4(&dst_ipv4).await else {
-            return Err(anyhow::anyhow!("no peer found for dst: {}", nat_dst).into());
-        };
-
-        let Some(dst_peer_info) = peer_mgr.get_peer_map().get_route_peer_info(dst_peer).await
-        else {
-            return Err(anyhow::anyhow!("no peer info found for dst peer: {}", dst_peer).into());
-        };
-
-        let Some(dst_ipv4): Option<Ipv4Addr> = dst_peer_info.ipv4_addr.map(Into::into) else {
-            return Err(anyhow::anyhow!("no ipv4 found for dst peer: {}", dst_peer).into());
-        };
-
-        let Some(quic_port) = dst_peer_info.quic_port else {
-            return Err(anyhow::anyhow!("no quic port found for dst peer: {}", dst_peer).into());
-        };
-
-        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
-            .with_context(|| format!("failed to create QUIC endpoint for src: {}", src))?;
-        endpoint.set_default_client_config(configure_client());
-
-        // connect to server
-        let connection = {
-            let _g = peer_mgr.get_global_ctx().net_ns.guard();
-            endpoint
-                .connect(
-                    SocketAddr::new(dst_ipv4.into(), quic_port as u16),
-                    "localhost",
-                )
-                .unwrap()
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to connect to NAT destination {} from {}, real dst: {}",
-                        nat_dst, src, dst_ipv4
-                    )
-                })?
-        };
-
-        let (mut w, r) = connection
-            .open_bi()
-            .await
-            .with_context(|| "open_bi failed")?;
-
-        let proxy_dst_info = ProxyDstInfo {
-            dst_addr: Some(nat_dst.into()),
-        };
-        let proxy_dst_info_buf = proxy_dst_info.encode_to_vec();
-        let buf_len = proxy_dst_info_buf.len() as u8;
-        w.write(&buf_len.to_le_bytes())
-            .await
-            .with_context(|| "failed to write proxy dst info buf len to QUIC stream")?;
-        w.write(&proxy_dst_info_buf)
-            .await
-            .with_context(|| "failed to write proxy dst info to QUIC stream")?;
-
-        Ok(QUICStream {
-            endpoint: Some(endpoint),
-            connection: Some(connection),
-            sender: w,
-            receiver: r,
-        })
-    }
-
-    fn check_packet_from_peer_fast(&self, _cidr_set: &CidrSet, _global_ctx: &GlobalCtx) -> bool {
-        true
-    }
-
-    fn check_packet_from_peer(
-        &self,
-        _cidr_set: &CidrSet,
-        _global_ctx: &GlobalCtx,
-        hdr: &PeerManagerHeader,
-        _ipv4: &Ipv4Packet,
-        _real_dst_ip: &mut Ipv4Addr,
-    ) -> bool {
-        hdr.from_peer_id == hdr.to_peer_id && !hdr.is_kcp_src_modified()
-    }
-
-    fn transport_type(&self) -> TcpProxyEntryTransportType {
-        TcpProxyEntryTransportType::Quic
+        poll.map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))
     }
 }
 
-#[derive(Clone)]
-struct TcpProxyForQUICSrc(Arc<TcpProxy<NatDstQUICConnector>>);
-
-#[async_trait::async_trait]
-impl TcpProxyForKcpSrcTrait for TcpProxyForQUICSrc {
-    type Connector = NatDstQUICConnector;
-
-    fn get_tcp_proxy(&self) -> &Arc<TcpProxy<Self::Connector>> {
-        &self.0
-    }
-
-    async fn check_dst_allow_kcp_input(&self, dst_ip: &Ipv4Addr) -> bool {
-        let peer_map: Arc<crate::peers::peer_map::PeerMap> =
-            self.0.get_peer_manager().get_peer_map();
-        let Some(dst_peer_id) = peer_map.get_peer_id_by_ipv4(dst_ip).await else {
-            return false;
-        };
-        let Some(peer_info) = peer_map.get_route_peer_info(dst_peer_id).await else {
-            return false;
-        };
-        tracing::debug!(
-            "check dst {} allow quic input, peer info: {:?}",
-            dst_ip,
-            peer_info
-        );
-        let Some(quic_port) = peer_info.quic_port else {
-            return false;
-        };
-        quic_port > 0
-    }
+#[derive(Debug)]
+pub struct QuicSocket {
+    addr: SocketAddr,
+    rx: AtomicRefCell<Receiver<QuicPacket>>,
+    tx: Sender<QuicPacket>,
+    margins: PacketMargins,
 }
 
-pub struct QUICProxySrc {
-    peer_manager: Arc<PeerManager>,
-    tcp_proxy: TcpProxyForQUICSrc,
-}
+impl AsyncUdpSocket for QuicSocket {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+        Box::into_pin(Box::new(QuicSocketPoller {
+            tx: PollSender::new(self.tx.clone()),
+        }))
+    }
 
-impl QUICProxySrc {
-    pub async fn new(peer_manager: Arc<PeerManager>) -> Self {
-        let tcp_proxy = TcpProxy::new(
-            peer_manager.clone(),
-            NatDstQUICConnector {
-                peer_mgr: Arc::downgrade(&peer_manager),
-            },
-        );
+    fn try_send(&self, transmit: &Transmit) -> std::io::Result<()> {
+        match transmit.destination {
+            SocketAddr::V4(addr) => {
+                let len = transmit.contents.len();
+                trace!("{:?} sending {:?} bytes to {:?}", self.addr, len, addr);
 
-        Self {
-            peer_manager,
-            tcp_proxy: TcpProxyForQUICSrc(tcp_proxy),
+                let permit = self.tx.try_reserve().map_err(|e| match e {
+                    TrySendError::Full(_) => std::io::ErrorKind::WouldBlock,
+                    TrySendError::Closed(_) => std::io::ErrorKind::BrokenPipe,
+                })?;
+
+                let segment_size = transmit.segment_size.unwrap_or(len);
+                let chunks = transmit.contents.chunks(segment_size);
+                let segment = segment_size + self.margins.len();
+
+                let mut payload = BytesMut::with_capacity(chunks.len() * segment);
+
+                // The length of the last chunk could be smaller than segment_size
+                for chunk in chunks {
+                    let len = chunk.len();
+                    unsafe {
+                        copy_nonoverlapping(
+                            chunk.as_ptr(),
+                            payload.chunk_mut().as_mut_ptr().add(self.margins.header),
+                            len,
+                        );
+                        payload.advance_mut(len + self.margins.len());
+                    }
+                }
+
+                permit.send(QuicPacket {
+                    addr: transmit.destination,
+                    payload,
+                    segment: Some(segment),
+                    ecn: transmit.ecn,
+                });
+
+                Ok(())
+            }
+            _ => Err(std::io::ErrorKind::ConnectionRefused.into()),
         }
     }
 
-    pub async fn start(&self) {
-        self.peer_manager
-            .add_nic_packet_process_pipeline(Box::new(self.tcp_proxy.clone()))
-            .await;
-        self.peer_manager
-            .add_packet_process_pipeline(Box::new(self.tcp_proxy.0.clone()))
-            .await;
-        self.tcp_proxy.0.start(false).await.unwrap();
+    fn poll_recv(
+        &self,
+        cx: &mut std::task::Context,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> Poll<std::io::Result<usize>> {
+        if bufs.is_empty() || meta.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        let mut rx = self.rx.borrow_mut();
+        let mut count = 0;
+
+        for (buf, meta) in bufs.iter_mut().zip(meta.iter_mut()) {
+            match rx.poll_recv(cx) {
+                Poll::Ready(Some(packet)) => {
+                    let len = packet.payload.len();
+                    if len > buf.len() {
+                        warn!(
+                            "buffer too small for packet: {:?} < {:?}, dropped",
+                            buf.len(),
+                            len,
+                        );
+                        continue;
+                    }
+                    trace!(
+                        "{:?} received {:?} bytes from {:?}",
+                        self.addr, len, packet.addr
+                    );
+                    buf[0..len].copy_from_slice(&packet.payload);
+                    *meta = RecvMeta {
+                        addr: packet.addr,
+                        len,
+                        stride: len,
+                        ecn: packet.ecn,
+                        dst_ip: None,
+                    };
+                    count += 1;
+                }
+                Poll::Ready(None) if count > 0 => break,
+                Poll::Ready(None) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        "socket closed",
+                    )));
+                }
+                Poll::Pending => break,
+            }
+        }
+
+        if count > 0 {
+            Poll::Ready(Ok(count))
+        } else {
+            Poll::Pending
+        }
     }
 
-    pub fn get_tcp_proxy(&self) -> Arc<TcpProxy<NatDstQUICConnector>> {
-        self.tcp_proxy.0.clone()
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        Ok(self.addr)
+    }
+}
+//endregion
+
+//region addr
+#[derive(Debug, Clone, Copy, Constructor)]
+struct QuicAddr {
+    peer_id: PeerId,
+    packet_type: PacketType,
+}
+
+impl From<QuicAddr> for SocketAddr {
+    #[inline]
+    fn from(value: QuicAddr) -> Self {
+        SocketAddr::new(IpAddr::V4(value.peer_id.into()), value.packet_type as u16)
     }
 }
 
-pub struct QUICProxyDst {
-    global_ctx: Arc<GlobalCtx>,
-    endpoint: Arc<quinn::Endpoint>,
-    proxy_entries: Arc<DashMap<SocketAddr, TcpProxyEntry>>,
-    tasks: Arc<Mutex<JoinSet<()>>>,
-    route: Arc<dyn crate::peers::route_trait::Route + Send + Sync + 'static>,
-}
+impl TryFrom<SocketAddr> for QuicAddr {
+    type Error = ();
 
-impl QUICProxyDst {
-    pub fn new(
-        global_ctx: ArcGlobalCtx,
-        route: Arc<dyn crate::peers::route_trait::Route + Send + Sync + 'static>,
-    ) -> Result<Self> {
-        let _g = global_ctx.net_ns.guard();
-        let (endpoint, _) = make_server_endpoint(
-            format!("0.0.0.0:{}", global_ctx.config.get_flags().quic_listen_port)
-                .parse()
-                .unwrap(),
-        )
-        .map_err(|e| anyhow::anyhow!("failed to create QUIC endpoint: {}", e))?;
-        let tasks = Arc::new(Mutex::new(JoinSet::new()));
-        join_joinset_background(tasks.clone(), "QUICProxyDst tasks".to_string());
+    #[inline]
+    fn try_from(value: SocketAddr) -> Result<Self, Self::Error> {
+        let IpAddr::V4(ipv4) = value.ip() else {
+            return Err(());
+        };
+        let peer_id = ipv4.into();
+
+        let packet_type = match value.port() {
+            p if p == PacketType::QuicSrc as u16 => PacketType::QuicSrc,
+            p if p == PacketType::QuicDst as u16 => PacketType::QuicDst,
+            _ => return Err(()),
+        };
+
         Ok(Self {
-            global_ctx,
-            endpoint: Arc::new(endpoint),
-            proxy_entries: Arc::new(DashMap::new()),
-            tasks,
-            route,
+            peer_id,
+            packet_type,
         })
     }
+}
+//endregion
 
-    pub async fn start(&self) -> Result<()> {
-        let endpoint = self.endpoint.clone();
-        let tasks = Arc::downgrade(&self.tasks.clone());
-        let ctx = self.global_ctx.clone();
-        let cidr_set = Arc::new(CidrSet::new(ctx.clone()));
-        let proxy_entries = self.proxy_entries.clone();
-        let route = self.route.clone();
+//region stream
+type QuicStreamInner = Join<RecvStream, SendStream>;
+#[derive(Debug, Deref, DerefMut, From, Into)]
+struct QuicStream {
+    #[deref]
+    #[deref_mut]
+    inner: QuicStreamInner,
+}
 
-        let task = async move {
-            loop {
-                match endpoint.accept().await {
-                    Some(conn) => {
-                        let Some(tasks) = tasks.upgrade() else {
-                            tracing::warn!(
-                                "QUICProxyDst tasks is not available, stopping accept loop"
-                            );
-                            return;
-                        };
-                        tasks
-                            .lock()
-                            .unwrap()
-                            .spawn(Self::handle_connection_with_timeout(
-                                conn,
-                                ctx.clone(),
-                                cidr_set.clone(),
-                                proxy_entries.clone(),
-                                route.clone(),
-                            ));
+impl From<(SendStream, RecvStream)> for QuicStream {
+    #[inline]
+    fn from(value: (SendStream, RecvStream)) -> Self {
+        join(value.1, value.0).into()
+    }
+}
+//endregion
+
+#[derive(Debug, Clone)]
+pub struct NatDstQuicConnector {
+    pub(crate) endpoint: Endpoint,
+    pub(crate) conn_map: Cache<PeerId, Connection>,
+}
+
+impl NatDstQuicConnector {
+    async fn connect_to_peer(
+        &self,
+        dst_peer: PeerId,
+        src: SocketAddr,
+        nat_dst: SocketAddr,
+    ) -> anyhow::Result<QuicStreamInner> {
+        tracing::trace!(?nat_dst, ?dst_peer, "quic nat");
+
+        let header = {
+            let conn_data = QuicConnData {
+                src: Some(src.into()),
+                dst: Some(nat_dst.into()),
+            };
+
+            let len = conn_data.encoded_len();
+            ensure!(len <= u16::MAX as usize, "conn data too large: {len}");
+
+            let mut buf = BytesMut::with_capacity(2 + len);
+
+            buf.put_u16(len as u16);
+            conn_data.encode(&mut buf)?;
+
+            buf.freeze()
+        };
+
+        let reconnect = || async move {
+            self.conn_map.invalidate(&dst_peer).await;
+
+            let connect = (0..5)
+                .map(|_| {
+                    let endpoint = self.endpoint.clone();
+                    async move {
+                        endpoint
+                            .connect(QuicAddr::new(dst_peer, PacketType::QuicSrc).into(), "")
+                            .context("failed to create connection")?
+                            .await
+                            .context("connection failed")
                     }
-                    None => {
-                        return;
+                })
+                .hedge(Duration::from_millis(200));
+
+            self.conn_map
+                .try_get_with(dst_peer, connect)
+                .await
+                .context("failed to connect to peer")
+        };
+
+        let mut reconnected = false;
+
+        let mut connection = if let Some(connection) = self.conn_map.get(&dst_peer).await
+            && connection.close_reason().is_none()
+        {
+            connection
+        } else {
+            reconnected = true;
+            reconnect().await?
+        };
+
+        loop {
+            let is_retryable = |error: &ConnectionError| {
+                matches!(
+                    error,
+                    ConnectionError::ConnectionClosed(_)
+                        | ConnectionError::ApplicationClosed(_)
+                        | ConnectionError::Reset
+                        | ConnectionError::TimedOut
+                )
+            };
+            let mut retry = !reconnected;
+            let header = header.clone();
+            let result = async {
+                let mut stream: QuicStream = connection
+                    .open_bi()
+                    .await
+                    .inspect_err(|error| retry &= is_retryable(error))?
+                    .into();
+                stream
+                    .writer_mut()
+                    .write_chunk(header)
+                    .await
+                    .inspect_err(|error| {
+                        retry &= matches!(error, WriteError::ConnectionLost(error) if is_retryable(error))
+                    })?;
+                Ok(stream.into())
+            }
+                .await;
+
+            if let Err(error) = &result {
+                if retry {
+                    debug!(?error, "failed to open quic stream, retrying...");
+                    reconnected = true;
+                    connection = reconnect().await?;
+                    continue;
+                } else {
+                    self.conn_map.invalidate(&dst_peer).await;
+                }
+            }
+
+            break result;
+        }
+    }
+}
+
+#[derive(Debug)]
+enum QuicProxyRole {
+    Src,
+    Dst,
+}
+
+impl QuicProxyRole {
+    #[inline]
+    const fn outgoing(&self) -> PacketType {
+        match self {
+            QuicProxyRole::Src => PacketType::QuicSrc,
+            QuicProxyRole::Dst => PacketType::QuicDst,
+        }
+    }
+}
+
+// Send to peers packets received from the QUIC endpoint
+#[derive(Debug)]
+struct QuicPacketSender {
+    datagrams: Sender<WrappedTransportDatagram>,
+    rx: Receiver<QuicPacket>,
+
+    header: Bytes,
+    zc_packet_type: ZCPacketType,
+    margins: PacketMargins,
+}
+
+impl QuicPacketSender {
+    #[instrument]
+    pub async fn run(mut self) {
+        while let Some(packet) = self.rx.recv().await {
+            let Ok(addr) = QuicAddr::try_from(packet.addr) else {
+                error!("invalid quic packet addr: {:?}", packet.addr);
+                continue;
+            };
+
+            let mut payload = packet.payload;
+            let segment = packet
+                .segment
+                .expect("segment size must be set for outgoing quic packet");
+
+            while !payload.is_empty() {
+                let len = min(payload.len(), segment);
+                let mut payload = payload.split_to(len);
+                payload[..self.margins.header].copy_from_slice(&self.header);
+                payload.truncate(len - self.margins.trailer);
+                let role = match addr.packet_type {
+                    PacketType::QuicSrc => WrappedTransportRole::Source,
+                    PacketType::QuicDst => WrappedTransportRole::Destination,
+                    packet_type => {
+                        error!(?packet_type, "invalid QUIC proxy output packet type");
+                        continue;
+                    }
+                };
+                if self
+                    .datagrams
+                    .send(WrappedTransportDatagram {
+                        transport: WrappedTransportKind::Quic,
+                        role,
+                        peer_id: addr.peer_id,
+                        buffer: WrappedTransportDatagramBuffer::from_packet_buffer(
+                            payload,
+                            self.zc_packet_type,
+                        ),
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+struct QuicStreamReceiver {
+    endpoint: Endpoint,
+    tasks: JoinSet<()>,
+    destination_ingress: WrappedTransportDestinationIngress,
+    cancel: CancellationToken,
+}
+
+impl QuicStreamReceiver {
+    async fn run(mut self) {
+        loop {
+            select! {
+                biased;
+
+                _ = self.cancel.cancelled() => break,
+
+                Some(incoming) = self.endpoint.accept() => {
+                    let addr = incoming.remote_address();
+                    let connection = match incoming.accept() {
+                        Ok(connection) => connection,
+                        Err(e) => {
+                            error!("failed to accept quic connection from {:?}: {:?}", addr, e);
+                            continue;
+                        }
+                    };
+
+                    let addr = connection.remote_address();
+                    let connection = select! {
+                        biased;
+                        _ = self.cancel.cancelled() => break,
+                        result = connection => {
+                            match result {
+                                Ok(connection) => connection,
+                                Err(e) => {
+                                    error!("failed to accept quic connection from {:?}: {:?}", addr, e);
+                                    continue;
+                                }
+                            }
+                        }
+                    };
+
+                    let destination_ingress = self.destination_ingress.clone();
+                    let cancel = self.cancel.clone();
+                    self.tasks.spawn(async move {
+                        let mut tasks = JoinSet::new();
+                        loop {
+                            select! {
+                                biased;
+
+                                _ = cancel.cancelled() => break,
+
+                                e = connection.closed() => {
+                                    info!("connection to {:?} closed: {:?}", addr, e);
+                                    break;
+                                }
+
+                                stream = connection.accept_bi() => {
+                                    let stream = match stream {
+                                        Ok(stream) => stream.into(),
+                                        Err(e) => {
+                                            warn!("failed to accept bi stream from {:?}: {:?}", connection.remote_address(), e);
+                                            break;
+                                        }
+                                    };
+
+                                    let destination_ingress = destination_ingress.clone();
+                                    tasks.spawn(async move {
+                                        if let Err(e) = Self::submit_stream(stream, destination_ingress).await {
+                                            warn!("failed to submit quic stream: {:?}", e);
+                                        }
+                                    });
+                                }
+
+                                res = tasks.join_next(), if !tasks.is_empty() => {
+                                    debug!("quic stream task completed for {:?}: {:?}", addr, res);
+                                }
+                            }
+                        }
+
+                        tasks.shutdown().await;
+                        connection.close(1u32.into(), b"error");
+                    });
+                }
+
+                _ = self.tasks.join_next(), if !self.tasks.is_empty() => {}
+
+                else => {
+                    info!("quic stream receiver endpoint closed, exiting");
+                    break;
+                }
+            }
+        }
+        if self.cancel.is_cancelled() {
+            while self.tasks.join_next().await.is_some() {}
+        } else {
+            self.tasks.shutdown().await;
+        }
+    }
+
+    async fn read_stream_header(stream: &mut QuicStream) -> Result<Bytes, Error> {
+        const STREAM_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
+        const STREAM_HEADER_LIMIT: u16 = 512;
+        let len = timeout(STREAM_HEADER_READ_TIMEOUT, stream.read_u16())
+            .await
+            .context("timeout reading header length")??;
+        if len > STREAM_HEADER_LIMIT {
+            return Err(anyhow::anyhow!("stream header too long"));
+        }
+        let mut header = Vec::with_capacity(len as usize);
+        timeout(
+            STREAM_HEADER_READ_TIMEOUT,
+            stream
+                .reader_mut()
+                .take(len as u64)
+                .read_to_end(&mut header),
+        )
+        .await
+        .context("timeout reading header")??;
+        Ok(header.into())
+    }
+
+    async fn submit_stream(
+        mut stream: QuicStream,
+        destination_ingress: WrappedTransportDestinationIngress,
+    ) -> Result<(), Error> {
+        let conn_data = Self::read_stream_header(&mut stream).await?;
+        let conn_data_parsed = QuicConnData::decode(conn_data.as_ref())
+            .context("failed to decode quic stream header")?;
+
+        let src_socket: SocketAddr = conn_data_parsed
+            .src
+            .ok_or_else(|| anyhow!("missing src addr in quic stream header"))?
+            .into();
+        let dst_socket: SocketAddr = conn_data_parsed
+            .dst
+            .ok_or_else(|| anyhow!("missing dst addr in quic stream header"))?
+            .into();
+
+        destination_ingress
+            .submit(WrappedTransportAcceptedStream {
+                src: src_socket,
+                dst: dst_socket,
+                initial_acl_packet_size: conn_data.len(),
+                stream: Box::new(stream.inner),
+            })
+            .await
+    }
+}
+
+pub struct QuicProxy {
+    endpoint: Option<Endpoint>,
+    input_tx: Option<Arc<Sender<QuicPacket>>>,
+
+    source_connector: Option<NatDstQuicConnector>,
+    destination_ingress: Option<WrappedTransportDestinationIngress>,
+
+    tasks: JoinSet<()>,
+    stream_cancel: CancellationToken,
+    stream_task: Option<JoinHandle<()>>,
+}
+
+impl QuicProxy {
+    pub fn new() -> Self {
+        Self {
+            endpoint: None,
+            input_tx: None,
+            source_connector: None,
+            destination_ingress: None,
+            tasks: JoinSet::new(),
+            stream_cancel: CancellationToken::new(),
+            stream_task: None,
+        }
+    }
+
+    pub async fn prepare(
+        &mut self,
+        my_peer_id: u32,
+        src: bool,
+        destination_ingress: Option<WrappedTransportDestinationIngress>,
+        datagrams: Sender<WrappedTransportDatagram>,
+    ) {
+        trace!("quic proxy starting");
+
+        if self.endpoint.is_some() {
+            error!("quic proxy already running");
+            return;
+        }
+
+        let (header, zc_packet_type) = {
+            let header = ZCPacket::new_with_payload(&[]);
+            let zc_packet_type = header.packet_type();
+            let payload_offset = header.payload_offset();
+            (
+                header.inner().split_to(payload_offset).freeze(),
+                zc_packet_type,
+            )
+        };
+
+        let margins = (header.len(), TAIL_RESERVED_SIZE).into();
+
+        let (in_tx, in_rx) = channel(1024);
+        let in_tx = Arc::new(in_tx);
+        self.input_tx = Some(in_tx.clone());
+        let (out_tx, out_rx) = channel(1024);
+
+        let socket = QuicSocket {
+            addr: SocketAddr::new(Ipv4Addr::from(my_peer_id).into(), 0),
+            rx: AtomicRefCell::new(in_rx),
+            tx: out_tx,
+            margins,
+        };
+
+        let mut endpoint = Endpoint::new_with_abstract_socket(
+            endpoint_config(),
+            Some(server_config()),
+            Arc::new(socket),
+            default_runtime().unwrap(),
+        )
+        .unwrap(); // TODO: maybe a different transport config
+        endpoint.set_default_client_config(client_config());
+        self.endpoint = Some(endpoint.clone());
+
+        self.tasks.spawn(
+            QuicPacketSender {
+                datagrams,
+                rx: out_rx,
+                header,
+                zc_packet_type,
+                margins,
+            }
+            .run(),
+        );
+
+        if src {
+            if self.source_connector.is_some() {
+                error!("quic proxy src already running");
+                return;
+            }
+
+            self.source_connector = Some(NatDstQuicConnector {
+                endpoint: endpoint.clone(),
+                conn_map: Cache::builder()
+                    .max_capacity(u8::MAX.into()) // cf. quinn transport config (max_concurrent_bidi_streams)
+                    .time_to_idle(Duration::from_secs(600)) // cf. quinn transport config (max_idle_timeout)
+                    .build(),
+            });
+        }
+
+        if let Some(destination_ingress) = destination_ingress {
+            if self.destination_ingress.is_some() {
+                error!("quic proxy dst already running");
+                return;
+            }
+            self.destination_ingress = Some(destination_ingress);
+        }
+    }
+
+    async fn activate(&mut self) -> anyhow::Result<()> {
+        if let Some(destination_ingress) = self.destination_ingress.as_ref() {
+            let endpoint = self
+                .endpoint
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| anyhow!("QUIC endpoint is not prepared"))?;
+            self.stream_task = Some(tokio::spawn(
+                QuicStreamReceiver {
+                    endpoint,
+                    tasks: JoinSet::new(),
+                    destination_ingress: destination_ingress.clone(),
+                    cancel: self.stream_cancel.clone(),
+                }
+                .run(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn stop(&mut self) {
+        self.stream_cancel.cancel();
+        if let Some(task) = self.stream_task.as_mut() {
+            let _ = task.await;
+        }
+        self.stream_task.take();
+        self.tasks.shutdown().await;
+        if let Some(endpoint) = self.endpoint.take() {
+            endpoint.close(1u32.into(), b"stopped");
+        }
+    }
+}
+
+pub struct QuicProxyService {
+    state: Mutex<Option<QuicProxy>>,
+}
+
+impl QuicProxyService {
+    pub fn new() -> Self {
+        Self {
+            state: Mutex::new(None),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl WrappedTransportEngine for QuicProxyService {
+    async fn prepare(&self, options: WrappedTransportEngineStart) -> anyhow::Result<()> {
+        let mut state = self.state.lock().await;
+        if state.is_some() {
+            return Ok(());
+        }
+        let directions = options.directions;
+        let destination_ingress = if directions.destination {
+            Some(
+                options
+                    .destination_ingress
+                    .ok_or_else(|| anyhow!("QUIC destination ingress is required"))?,
+            )
+        } else {
+            None
+        };
+
+        let mut proxy = QuicProxy::new();
+        if directions.source || directions.destination {
+            proxy
+                .prepare(
+                    options.my_peer_id,
+                    directions.source,
+                    destination_ingress,
+                    options.datagrams,
+                )
+                .await;
+        }
+
+        *state = Some(proxy);
+        Ok(())
+    }
+
+    async fn activate(&self) -> anyhow::Result<()> {
+        let mut state = self.state.lock().await;
+        state
+            .as_mut()
+            .ok_or_else(|| anyhow!("QUIC engine is not prepared"))?
+            .activate()
+            .await
+    }
+
+    async fn inject_peer_datagram(
+        &self,
+        role: WrappedTransportRole,
+        from_peer_id: u32,
+        payload: Bytes,
+    ) -> anyhow::Result<()> {
+        let tx = {
+            let state = self.state.lock().await;
+            state.as_ref().and_then(|proxy| proxy.input_tx.clone())
+        }
+        .ok_or_else(|| anyhow!("QUIC endpoint is not active"))?;
+        let role = match role {
+            WrappedTransportRole::Source => QuicProxyRole::Src,
+            WrappedTransportRole::Destination => QuicProxyRole::Dst,
+        };
+        tx.try_send(QuicPacket::new(
+            QuicAddr::new(from_peer_id, role.outgoing()).into(),
+            payload.into(),
+            None,
+            None,
+        ))
+        .map_err(|error| anyhow!("failed to inject QUIC datagram: {error}"))
+    }
+
+    async fn connect_source(
+        &self,
+        request: WrappedTransportConnect,
+    ) -> anyhow::Result<Box<dyn TcpProxyStream>> {
+        let connector = {
+            let state = self.state.lock().await;
+            state
+                .as_ref()
+                .and_then(|proxy| proxy.source_connector.clone())
+        }
+        .ok_or_else(|| anyhow!("QUIC source endpoint is not prepared"))?;
+        let stream = connector
+            .connect_to_peer(request.dst_peer_id, request.src, request.dst)
+            .await?;
+        Ok(Box::new(stream))
+    }
+
+    async fn stop(&self) {
+        let mut state = self.state.lock().await;
+        if let Some(active) = state.as_mut() {
+            active.stop().await;
+        }
+        state.take();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Buf;
+    use quanta::Instant;
+
+    /// Helper function: Create a pair of interconnected QuicSockets.
+    /// Data sent by socket_a will enter socket_b's rx, and vice versa.
+    fn make_socket_pair() -> (QuicSocket, QuicSocket) {
+        let addr_a: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:5001".parse().unwrap();
+
+        // Bidirectional channels: A->B and B->A
+        // Sufficient capacity to prevent packet loss during high concurrency
+        let (tx_a_out, rx_a_out) = channel::<QuicPacket>(50_000);
+        let (tx_b_in, rx_b_in) = channel::<QuicPacket>(50_000);
+
+        let (tx_b_out, rx_b_out) = channel::<QuicPacket>(50_000);
+        let (tx_a_in, rx_a_in) = channel::<QuicPacket>(50_000);
+
+        let margins = (20, 25).into();
+
+        forward(rx_a_out, tx_b_in, addr_a, margins);
+        forward(rx_b_out, tx_a_in, addr_b, margins);
+
+        let socket_a = QuicSocket {
+            addr: addr_a,
+            rx: AtomicRefCell::new(rx_a_in),
+            tx: tx_a_out,
+            margins,
+        };
+
+        let socket_b = QuicSocket {
+            addr: addr_b,
+            rx: AtomicRefCell::new(rx_b_in),
+            tx: tx_b_out,
+            margins,
+        };
+
+        (socket_a, socket_b)
+    }
+
+    fn endpoint() -> (Endpoint, Endpoint) {
+        let endpoint_config = endpoint_config();
+        let server_config = server_config();
+        let client_config = client_config();
+
+        // 1. Create an in-memory Socket pair
+        let (socket_client, socket_server) = make_socket_pair();
+        let socket_client = Arc::new(socket_client);
+        let socket_server = Arc::new(socket_server);
+
+        // 3. Configure Client Endpoint
+        let mut client_endpoint = Endpoint::new_with_abstract_socket(
+            endpoint_config.clone(),
+            Some(server_config.clone()),
+            socket_client.clone(),
+            default_runtime().unwrap(),
+        )
+        .unwrap();
+        client_endpoint.set_default_client_config(client_config.clone());
+
+        // 2. Configure Server Endpoint
+        let mut server_endpoint = Endpoint::new_with_abstract_socket(
+            endpoint_config.clone(),
+            Some(server_config.clone()),
+            socket_server.clone(),
+            default_runtime().unwrap(),
+        )
+        .unwrap();
+        server_endpoint.set_default_client_config(client_config.clone());
+
+        (client_endpoint, server_endpoint)
+    }
+
+    fn forward(
+        mut rx: Receiver<QuicPacket>,
+        tx: Sender<QuicPacket>,
+        addr: SocketAddr,
+        margins: PacketMargins,
+    ) {
+        const BATCH_SIZE: usize = 128;
+        tokio::spawn(async move {
+            // Key optimization: use buffer for batch processing
+            let mut buffer = Vec::with_capacity(BATCH_SIZE);
+
+            // recv_many wakes up when data is available, taking up to 100 packets at a time
+            // This reduces context switch overhead by 99 times compared to taking 1 packet at a time
+            while rx.recv_many(&mut buffer, BATCH_SIZE).await > 0 {
+                for packet in buffer.iter_mut() {
+                    // [Filter Logic]: Modify address here
+                    packet.addr = addr;
+                    packet.payload.advance(margins.header);
+                    packet
+                        .payload
+                        .truncate(packet.payload.len() - margins.trailer);
+                }
+                // Batch forward
+                for packet in buffer.drain(..) {
+                    if let Err(e) = tx.send(packet).await {
+                        info!("{:?}", e);
+                        return; // Channel closed
                     }
                 }
             }
-        };
+        });
+    }
 
-        self.tasks.lock().unwrap().spawn(task);
+    #[tokio::test]
+    async fn test_ping() -> anyhow::Result<()> {
+        let (client_endpoint, server_endpoint) = endpoint();
+        let server_addr = server_endpoint.local_addr()?;
+
+        // 4. Server receive task
+        let server_handle = tokio::spawn(async move {
+            println!("Server: Waiting for connection...");
+            if let Some(conn) = server_endpoint.accept().await {
+                let connection = conn.await.unwrap();
+                println!(
+                    "Server: Connection accepted from {}",
+                    connection.remote_address()
+                );
+
+                // Accept bidirectional stream
+                let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+
+                // Read data
+                let mut buf = vec![0u8; 10];
+                recv.read_exact(&mut buf).await.unwrap();
+                assert_eq!(&buf, b"ping______");
+                println!("Server: Received 'ping______'");
+
+                // Send reply
+                send.write_all(b"pong______").await.unwrap();
+                send.finish().unwrap();
+
+                let _ = connection.closed().await;
+            }
+        });
+
+        // 5. Client initiates connection
+        // Note: The connect address here must be V4, because try_send is limited to SocketAddr::V4
+        println!("Client: Connecting...");
+        let connection = client_endpoint.connect(server_addr, "localhost")?.await?;
+        println!("Client: Connected!");
+
+        // Open a stream and send data
+        let (mut send, mut recv) = connection.open_bi().await?;
+        send.write_all(b"ping______").await?;
+        send.finish()?;
+
+        // Read reply
+        let mut buf = vec![0u8; 10];
+        recv.read_exact(&mut buf).await?;
+        assert_eq!(&buf, b"pong______");
+        println!("Client: Received 'pong______'");
+
+        // 6. Cleanup
+        connection.close(0u32.into(), b"done");
+        // Wait for Server to finish
+        let _ = tokio::time::timeout(Duration::from_secs(2), server_handle).await;
 
         Ok(())
     }
 
-    pub fn local_addr(&self) -> Result<SocketAddr> {
-        self.endpoint.local_addr().map_err(Into::into)
+    #[tokio::test]
+    #[ignore = "consumes massive memory (~16GB)"]
+    async fn test_bandwidth() -> anyhow::Result<()> {
+        // --- 3. Define test data volume ---
+        // Total test size: 512 MB
+        const TOTAL_SIZE: usize = 32768 * 1024 * 1024;
+        // Write chunk size: 1 MB (simulate large chunk write)
+        const CHUNK_SIZE: usize = 1024 * 1024;
+
+        let (client_endpoint, server_endpoint) = endpoint();
+        let server_addr = server_endpoint.local_addr()?;
+
+        // --- 4. Server side (receive and timing) ---
+        let server_handle = tokio::spawn(async move {
+            if let Some(conn) = server_endpoint.accept().await {
+                let connection = conn.await.unwrap();
+                // Accept unidirectional stream
+                let mut recv = connection.accept_uni().await.unwrap();
+
+                let start = Instant::now();
+                let mut received = 0;
+
+                // Loop read until the stream ends
+                // read_chunk performs slightly better than read_exact because it reduces internal buffer copying
+                while let Some(chunk) = recv.read_chunk(usize::MAX, true).await.unwrap() {
+                    received += chunk.bytes.len();
+                }
+
+                let duration = start.elapsed();
+                assert_eq!(received, TOTAL_SIZE, "Data length mismatch");
+
+                let seconds = duration.as_secs_f64();
+                let mbps = (received as f64 * 8.0) / (1_000_000.0 * seconds);
+                let gbps = mbps / 1000.0;
+
+                println!("--------------------------------------------------");
+                println!("Server Recv Statistics:");
+                println!("  Total Data: {} MB", received / 1024 / 1024);
+                println!("  Duration  : {:.2?}", duration);
+                println!("  Throughput: {:.2} Gbps ({:.2} Mbps)", gbps, mbps);
+                println!("--------------------------------------------------");
+
+                // Keep connection until the Client disconnects
+                let _ = connection.closed().await;
+            }
+        });
+
+        // --- 5. Client side (send) ---
+        let connection = client_endpoint.connect(server_addr, "localhost")?.await?;
+        let mut send = connection.open_uni().await?;
+
+        // Construct a 1MB data chunk
+        let data_chunk = vec![0u8; CHUNK_SIZE];
+        let bytes_data = Bytes::from(data_chunk); // Use Bytes to avoid repeated allocation
+
+        println!("Client: Start sending {} MB...", TOTAL_SIZE / 1024 / 1024);
+        let start_send = Instant::now();
+
+        let chunks = TOTAL_SIZE / CHUNK_SIZE;
+        for _ in 0..chunks {
+            // write_chunk is most efficient when used with Bytes
+            send.write_chunk(bytes_data.clone()).await?;
+        }
+
+        // Tell peer sending is finished
+        send.finish()?;
+        // Wait for the stream to close completely (ensure peer received FIN)
+        send.stopped().await?;
+
+        let send_duration = start_send.elapsed();
+        println!("Client: Send finished in {:.2?}", send_duration);
+
+        // Close connection
+        connection.close(0u32.into(), b"done");
+
+        // Wait for Server to print results
+        let _ = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
+
+        Ok(())
     }
 
-    async fn handle_connection_with_timeout(
-        conn: Incoming,
-        ctx: Arc<GlobalCtx>,
-        cidr_set: Arc<CidrSet>,
-        proxy_entries: Arc<DashMap<SocketAddr, TcpProxyEntry>>,
-        route: Arc<dyn crate::peers::route_trait::Route + Send + Sync + 'static>,
-    ) {
-        let remote_addr = conn.remote_address();
-        defer!(
-            proxy_entries.remove(&remote_addr);
-            if proxy_entries.capacity() - proxy_entries.len() > 16 {
-                proxy_entries.shrink_to_fit();
-            }
-        );
-        let ret = timeout(
-            std::time::Duration::from_secs(10),
-            Self::handle_connection(
-                conn,
-                ctx,
-                cidr_set,
-                remote_addr,
-                proxy_entries.clone(),
-                route,
-            ),
-        )
-        .await;
+    #[tokio::test]
+    #[ignore = "consumes massive memory (~16GB)"]
+    async fn test_bandwidth_parallel() -> anyhow::Result<()> {
+        // --- 1. Configuration parameters ---
+        const STREAM_COUNT: usize = 16; // Number of concurrent streams
+        const STREAM_SIZE: usize = 1024 * 1024 * 1024; // Each stream sends 1GB
 
-        match ret {
-            Ok(Ok((quic_stream, tcp_stream, acl))) => {
-                let remote_addr = quic_stream.connection.as_ref().map(|c| c.remote_address());
-                let ret = acl.copy_bidirection_with_acl(quic_stream, tcp_stream).await;
-                tracing::info!(
-                    "QUIC connection handled, result: {:?}, remote addr: {:?}",
-                    ret,
-                    remote_addr,
+        let (client_endpoint, server_endpoint) = endpoint();
+        let server_addr = server_endpoint.local_addr()?;
+
+        // --- 3. Server side (concurrent receiver) ---
+        let server_handle = tokio::spawn(async move {
+            if let Some(conn) = server_endpoint.accept().await {
+                let connection = conn.await.unwrap();
+                println!("Server: Accepted connection");
+
+                let mut stream_handles = Vec::new();
+                let start = Instant::now();
+
+                // Accept an expected number of streams
+                for i in 0..STREAM_COUNT {
+                    match connection.accept_uni().await {
+                        Ok(mut recv) => {
+                            // Start an independent processing task for each stream
+                            let handle = tokio::spawn(async move {
+                                // Read all data
+                                match recv.read_to_end(usize::MAX).await {
+                                    Ok(data) => {
+                                        // Verify length
+                                        assert_eq!(
+                                            data.len(),
+                                            STREAM_SIZE,
+                                            "Stream {} length mismatch",
+                                            i
+                                        );
+                                        // Verify data content (verify data isolation)
+                                        // We agree that the first byte of data is (stream_index % 255)
+                                        // This ensures stream data is not mixed
+                                        let expected_byte = data[0] as usize; // Get the actual received marker
+                                        // Simple check of head and tail here, CRC can be used in production
+                                        if data[data.len() - 1] != data[0] {
+                                            panic!("Stream data corruption");
+                                        }
+                                        expected_byte // Return marker for statistics
+                                    }
+                                    Err(e) => panic!("Stream read error: {}", e),
+                                }
+                            });
+                            stream_handles.push(handle);
+                        }
+                        Err(e) => panic!("Failed to accept stream {}: {}", i, e),
+                    }
+                }
+
+                // Wait for all streams to finish processing
+                let results = futures::future::join_all(stream_handles).await;
+                let duration = start.elapsed();
+
+                let speed = ((STREAM_COUNT * STREAM_SIZE) as f64 * 8.0)
+                    / (duration.as_secs_f64() * 1_000_000.0);
+
+                println!("--------------------------------------------------");
+                println!("Server: All {} streams received processing.", results.len());
+                println!("Total Time: {:.2?}", duration);
+                println!(
+                    "Total Data: {} MB",
+                    (STREAM_COUNT * STREAM_SIZE) / 1024 / 1024
                 );
+                println!(
+                    "Average Speed: {:.2} Gbps ({:.2} Mbps)",
+                    speed / 1024.0,
+                    speed
+                );
+                println!("--------------------------------------------------");
+
+                // Keep connection until the Client disconnects
+                let _ = connection.closed().await;
             }
-            Ok(Err(e)) => {
-                tracing::error!("Failed to handle QUIC connection: {}", e);
-            }
-            Err(_) => {
-                tracing::warn!("Timeout while handling QUIC connection");
-            }
-        }
-    }
+        });
 
-    async fn handle_connection(
-        incoming: Incoming,
-        ctx: ArcGlobalCtx,
-        cidr_set: Arc<CidrSet>,
-        proxy_entry_key: SocketAddr,
-        proxy_entries: Arc<DashMap<SocketAddr, TcpProxyEntry>>,
-        route: Arc<dyn crate::peers::route_trait::Route + Send + Sync + 'static>,
-    ) -> Result<(QUICStream, TcpStream, ProxyAclHandler)> {
-        let conn = incoming.await.with_context(|| "accept failed")?;
-        let addr = conn.remote_address();
-        tracing::info!("Accepted QUIC connection from {}", addr);
-        let (w, mut r) = conn.accept_bi().await.with_context(|| "accept_bi failed")?;
-        let len = r
-            .read_u8()
-            .await
-            .with_context(|| "failed to read proxy dst info buf len")?;
-        let mut buf = vec![0u8; len as usize];
-        r.read_exact(&mut buf)
-            .await
-            .with_context(|| "failed to read proxy dst info")?;
-
-        let proxy_dst_info =
-            ProxyDstInfo::decode(&buf[..]).with_context(|| "failed to decode proxy dst info")?;
-
-        let dst_socket: SocketAddr = proxy_dst_info
-            .dst_addr
-            .map(Into::into)
-            .ok_or_else(|| anyhow::anyhow!("no dst addr in proxy dst info"))?;
-
-        let SocketAddr::V4(mut dst_socket) = dst_socket else {
-            return Err(anyhow::anyhow!("NAT destination must be an IPv4 address").into());
-        };
-
-        let mut real_ip = *dst_socket.ip();
-        if cidr_set.contains_v4(*dst_socket.ip(), &mut real_ip) {
-            dst_socket.set_ip(real_ip);
-        }
-
-        let src_ip = addr.ip();
-        let dst_ip = *dst_socket.ip();
-        let (src_groups, dst_groups) = tokio::join!(
-            route.get_peer_groups_by_ip(&src_ip),
-            route.get_peer_groups_by_ipv4(&dst_ip)
+        // --- 4. Client side (concurrent sender) ---
+        let connection = client_endpoint.connect(server_addr, "localhost")?.await?;
+        println!(
+            "Client: Connected, starting {} parallel streams...",
+            STREAM_COUNT
         );
 
-        let send_to_self = Some(*dst_socket.ip()) == ctx.get_ipv4().map(|ip| ip.address());
-        if send_to_self && ctx.no_tun() {
-            dst_socket = format!("127.0.0.1:{}", dst_socket.port()).parse().unwrap();
+        let start_send = Instant::now();
+        let mut client_tasks = Vec::new();
+
+        // Start sending tasks concurrently
+        for i in 0..STREAM_COUNT {
+            let conn = connection.clone();
+            client_tasks.push(tokio::spawn(async move {
+                // Open unidirectional stream
+                let mut send = conn.open_uni().await.expect("Failed to open stream");
+
+                // Construct data: use i as the padding marker to verify isolation
+                // All bytes are filled with (i % 255)
+                let fill_byte = (i % 255) as u8;
+                let data = vec![fill_byte; STREAM_SIZE];
+                let bytes_data = Bytes::from(data);
+
+                send.write_chunk(bytes_data).await.expect("Write failed");
+                send.finish().expect("Finish failed");
+                // Wait for Server to acknowledge receipt of FIN
+                send.stopped().await.expect("Stopped failed");
+            }));
         }
 
-        proxy_entries.insert(
-            proxy_entry_key,
-            TcpProxyEntry {
-                src: Some(addr.into()),
-                dst: Some(SocketAddr::V4(dst_socket).into()),
-                start_time: chrono::Local::now().timestamp() as u64,
-                state: TcpProxyEntryState::ConnectingDst.into(),
-                transport_type: TcpProxyEntryTransportType::Quic.into(),
-            },
-        );
+        // Wait for all sending tasks to complete
+        futures::future::join_all(client_tasks).await;
 
-        let acl_handler = ProxyAclHandler {
-            acl_filter: ctx.get_acl_filter().clone(),
-            packet_info: PacketInfo {
-                src_ip,
-                dst_ip: dst_ip.into(),
-                src_port: Some(addr.port()),
-                dst_port: Some(dst_socket.port()),
-                protocol: Protocol::Tcp,
-                packet_size: len as usize,
-                src_groups,
-                dst_groups,
-            },
-            chain_type: if send_to_self {
-                ChainType::Inbound
-            } else {
-                ChainType::Forward
-            },
-        };
-        acl_handler.handle_packet(&buf)?;
+        let send_duration = start_send.elapsed();
+        println!("Client: All streams sent in {:.2?}", send_duration);
 
-        let connector = NatDstTcpConnector {};
+        // Close connection
+        connection.close(0u32.into(), b"done");
 
-        let dst_stream = {
-            let _g = ctx.net_ns.guard();
-            connector
-                .connect("0.0.0.0:0".parse().unwrap(), dst_socket.into())
-                .await?
-        };
+        // Wait for Server to finish
+        let _ = tokio::time::timeout(Duration::from_secs(10), server_handle).await;
 
-        if let Some(mut e) = proxy_entries.get_mut(&proxy_entry_key) {
-            e.state = TcpProxyEntryState::Connected.into();
-        }
-
-        let quic_stream = QUICStream {
-            endpoint: None,
-            connection: Some(conn),
-            sender: w,
-            receiver: r,
-        };
-
-        Ok((quic_stream, dst_stream, acl_handler))
+        Ok(())
     }
-}
 
-#[derive(Clone)]
-pub struct QUICProxyDstRpcService(Weak<DashMap<SocketAddr, TcpProxyEntry>>);
+    #[tokio::test]
+    async fn test_gso() {
+        let margins = PacketMargins {
+            header: 20,
+            trailer: 25,
+        };
+        let (tx, rx) = channel(10);
 
-impl QUICProxyDstRpcService {
-    pub fn new(quic_proxy_dst: &QUICProxyDst) -> Self {
-        Self(Arc::downgrade(&quic_proxy_dst.proxy_entries))
-    }
-}
+        let socket = QuicSocket {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            rx: AtomicRefCell::new(rx),
+            tx,
+            margins,
+        };
 
-#[async_trait::async_trait]
-impl TcpProxyRpc for QUICProxyDstRpcService {
-    type Controller = BaseController;
-    async fn list_tcp_proxy_entry(
-        &self,
-        _: BaseController,
-        _request: ListTcpProxyEntryRequest, // Accept request of type HelloRequest
-    ) -> std::result::Result<ListTcpProxyEntryResponse, rpc_types::error::Error> {
-        let mut reply = ListTcpProxyEntryResponse::default();
-        if let Some(tcp_proxy) = self.0.upgrade() {
-            for item in tcp_proxy.iter() {
-                reply.entries.push(*item.value());
-            }
-        }
-        Ok(reply)
+        let total_len = 3000;
+        let segment_size = 1000;
+        let mut contents = Vec::with_capacity(total_len);
+
+        contents.extend(vec![1u8; 1000]);
+        contents.extend(vec![2u8; 1000]);
+        contents.extend(vec![3u8; 1000]);
+
+        let transmit = Transmit {
+            destination: "127.0.0.1:8000".parse().unwrap(),
+            ecn: None,
+            contents: &contents,
+            segment_size: Some(segment_size),
+            src_ip: None,
+        };
+
+        socket.try_send(&transmit).unwrap();
+
+        let mut rx = socket.rx.into_inner();
+        let packet = rx.recv().await.unwrap();
+
+        let actual_segment_size = segment_size + margins.len();
+        let payload = packet.payload;
+
+        let chunk1_start = margins.header;
+        let chunk1_data = &payload[chunk1_start..chunk1_start + segment_size];
+        assert_eq!(chunk1_data[0], 1u8, "Chunk 1 corrupted");
+
+        let chunk2_start = actual_segment_size + margins.header;
+        let chunk2_data = &payload[chunk2_start..chunk2_start + segment_size];
+        assert_eq!(chunk2_data[0], 2u8, "Chunk 2 corrupted");
+
+        let chunk3_start = actual_segment_size * 2 + margins.header;
+        let chunk3_data = &payload[chunk3_start..chunk3_start + segment_size];
+        assert_eq!(chunk3_data[0], 3u8, "Chunk 3 corrupted");
     }
 }

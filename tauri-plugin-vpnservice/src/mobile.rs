@@ -1,7 +1,7 @@
 use serde::de::DeserializeOwned;
 use tauri::{
-    plugin::{PluginApi, PluginHandle},
     AppHandle, Runtime,
+    plugin::{PluginApi, PluginHandle},
 };
 
 use crate::models::*;
@@ -49,6 +49,21 @@ impl<R: Runtime> Vpnservice<R> {
     pub fn stop_vpn(&self, payload: VoidRequest) -> crate::Result<Status> {
         self.0
             .run_mobile_plugin("stop_vpn", payload)
+            .map_err(Into::into)
+    }
+
+    pub fn get_vpn_status(&self, payload: VoidRequest) -> crate::Result<VpnStatus> {
+        self.0
+            .run_mobile_plugin("get_vpn_status", payload)
+            .map_err(Into::into)
+    }
+
+    pub fn consume_vpn_tile_action(
+        &self,
+        payload: VoidRequest,
+    ) -> crate::Result<VpnTileActionResponse> {
+        self.0
+            .run_mobile_plugin("consume_vpn_tile_action", payload)
             .map_err(Into::into)
     }
 }

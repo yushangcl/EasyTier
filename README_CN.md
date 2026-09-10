@@ -48,40 +48,42 @@
 
 选择最适合您需求的安装方式：
 
+Linux（推荐）：
 ```bash
-# 1. 下载预编译二进制文件（推荐，支持所有平台）
-# 访问 https://github.com/EasyTier/EasyTier/releases
+curl -fsSL "https://github.com/EasyTier/EasyTier/blob/main/script/install.sh?raw=true" | sudo bash -s install
+```
 
-# 2. 通过 cargo 安装（最新开发版本）
-cargo install --git https://github.com/EasyTier/EasyTier.git easytier
-
-# 3. 通过 Docker 安装
-# 参见 https://easytier.cn/guide/installation.html#%E5%AE%89%E8%A3%85%E6%96%B9%E5%BC%8F
-
-# 4. Linux 快速安装
-wget -O- https://raw.githubusercontent.com/EasyTier/EasyTier/main/script/install.sh | sudo bash -s install
-
-# 5. MacOS 通过 Homebrew 安装
+Homebrew（MacOS/Linux）：
+```bash
 brew tap brewforge/chinese
 brew install --cask easytier-gui
-
-# 6. OpenWrt Luci Web 界面
-# 访问 https://github.com/EasyTier/luci-app-easytier
-
-# 7.（可选）安装 Shell 补全功能：
-# Fish 补全
-easytier-core --gen-autocomplete fish > ~/.config/fish/completions/easytier-core.fish
-easytier-cli gen-autocomplete fish > ~/.config/fish/completions/easytier-cli.fish
-
 ```
+
+Windows（推荐，请以管理员权限运行）：
+```powershell
+irm "https://github.com/EasyTier/EasyTier/blob/main/script/install.ps1?raw=true" | iex
+```
+
+通过 cargo 安装（最新开发版本）：
+```bash
+cargo install --git https://github.com/EasyTier/EasyTier.git easytier
+```
+
+[下载预编译文件](https://github.com/EasyTier/EasyTier/releases)（推荐，支持所有平台）
+
+[通过 Docker 安装](https://easytier.cn/guide/installation.html#%E5%AE%89%E8%A3%85%E6%96%B9%E5%BC%8F)
+
+[安装 OpenWrt ipk 软件包](https://github.com/EasyTier/luci-app-easytier)
+
+附加步骤：
+
+[一键注册系统服务](https://easytier.cn/guide/network/oneclick-install-as-service.html)（系统启动时自动后台运行）
 
 ### 🚀 基本用法
 
 #### 使用共享节点快速组网
 
-EasyTier 支持使用共享公共节点快速组网。当您没有公网 IP 时，可以使用 EasyTier 社区提供的免费共享节点。节点会自动尝试 NAT 穿透并建立 P2P 连接。当 P2P 失败时，数据将通过共享节点中继。
-
-当前部署的共享公共节点是 `tcp://public.easytier.cn:11010`。
+EasyTier 支持使用共享节点快速组网。当您没有公网 IP 时，可以使用公共共享节点。节点会自动尝试 NAT 穿透并建立 P2P 连接。当 P2P 失败时，数据将通过共享节点中继。
 
 使用共享节点时，每个进入网络的节点需要提供相同的 `--network-name` 和 `--network-secret` 参数作为网络的唯一标识符。
 
@@ -91,14 +93,14 @@ EasyTier 支持使用共享公共节点快速组网。当您没有公网 IP 时�
 
 ```bash
 # 以管理员权限运行
-sudo easytier-core -d --network-name abc --network-secret abc -p tcp://public.easytier.cn:11010
+sudo easytier-core -d --network-name abc --network-secret abc -p tcp://<共享节点IP>:11010
 ```
 
 2. 在节点 B 上运行：
 
 ```bash
 # 以管理员权限运行
-sudo easytier-core -d --network-name abc --network-secret abc -p tcp://public.easytier.cn:11010
+sudo easytier-core -d --network-name abc --network-secret abc -p tcp://<共享节点IP>:11010
 ```
 
 执行成功后，可以使用 `easytier-cli` 检查网络状态：
@@ -106,9 +108,9 @@ sudo easytier-core -d --network-name abc --network-secret abc -p tcp://public.ea
 ```text
 | ipv4         | hostname       | cost  | lat_ms | loss_rate | rx_bytes | tx_bytes | tunnel_proto | nat_type | id         | version         |
 | ------------ | -------------- | ----- | ------ | --------- | -------- | -------- | ------------ | -------- | ---------- | --------------- |
-| 10.126.126.1 | abc-1          | Local | *      | *         | *        | *        | udp          | FullCone | 439804259  | 2.4.5-70e69a38~ |
-| 10.126.126.2 | abc-2          | p2p   | 3.452  | 0         | 17.33 kB | 20.42 kB | udp          | FullCone | 390879727  | 2.4.5-70e69a38~ |
-|              | PublicServer_a | p2p   | 27.796 | 0.000     | 50.01 kB | 67.46 kB | tcp          | Unknown  | 3771642457 | 2.4.5-70e69a38~ |
+| 10.126.126.1 | abc-1          | Local | *      | *         | *        | *        | udp          | FullCone | 439804259  | 2.6.2-70e69a38~ |
+| 10.126.126.2 | abc-2          | p2p   | 3.452  | 0         | 17.33 kB | 20.42 kB | udp          | FullCone | 390879727  | 2.6.2-70e69a38~ |
+|              | PublicServer_a | p2p   | 27.796 | 0.000     | 50.01 kB | 67.46 kB | tcp          | Unknown  | 3771642457 | 2.6.2-70e69a38~ |
 ```
 
 您可以测试节点之间的连通性：
@@ -125,7 +127,7 @@ ping 10.126.126.2
 
 ```bash
 # 连接多个共享节点
-sudo easytier-core -d --network-name abc --network-secret abc -p tcp://public.easytier.cn:11010 -p udp://public.easytier.cn:11010
+sudo easytier-core -d --network-name abc --network-secret abc -p tcp://<公共节点IP>:11010 -p udp://<公共节点IP>:11010
 ```
 
 #### 去中心化组网
@@ -248,8 +250,12 @@ ios <-.-> nodea <--> nodeb <-.-> id1
 1. 启动启用 WireGuard 门户的 EasyTier：
 
 ```bash
-# 在 0.0.0.0:11013 上监听，并使用 10.14.14.0/24 子网作为 WireGuard 客户端
-sudo easytier-core -i 10.144.144.1 --vpn-portal wg://0.0.0.0:11013/10.14.14.0/24
+# 将一个 WireGuard 客户端注册为虚拟 peer 10.144.144.3
+sudo easytier-core -i 10.144.144.1 \
+  --network-secret portal-secret \
+  --vpn-portal wg://0.0.0.0:11013 \
+  --vpn-portal-private-key "$(wg genkey)" \
+  --vpn-portal-client phone=10.144.144.3
 ```
 
 2. 获取 WireGuard 客户端配置：
@@ -259,10 +265,9 @@ sudo easytier-core -i 10.144.144.1 --vpn-portal wg://0.0.0.0:11013/10.14.14.0/24
 easytier-cli vpn-portal
 ```
 
-3. 在输出配置中：
-   - 将 `Interface.Address` 设置为 WireGuard 子网中的可用 IP
-   - 将 `Peer.Endpoint` 设置为您的 EasyTier 节点的公网 IP/域名
-   - 将修改后的配置导入到您的 WireGuard 客户端
+3. 如果输出配置中的 `Peer.Endpoint` 是通配地址，将其替换为 EasyTier
+   节点的公网 IP/域名后即可导入。`Interface.Address` 只是客户端本地地址，
+   可以改为任意 IPv4 地址；EasyTier 会把它转换成已注册的虚拟 peer 地址。
 
 #### 自建公共共享节点
 
@@ -293,6 +298,10 @@ sudo easytier-core --network-name mysharednode --network-secret mysharednode
 ## 许可证
 
 EasyTier 在 [LGPL-3.0](https://github.com/EasyTier/EasyTier/blob/main/LICENSE) 许可下发布。
+
+## 使用规范
+
+请仅将 EasyTier 用于合法用途，并遵守适用的法律法规。使用者有责任确保其已获授权连接和管理相关网络与设备。
 
 ## 赞助
 

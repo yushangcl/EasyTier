@@ -1,16 +1,14 @@
-pub mod rpc_impl;
-pub mod rpc_types;
+pub use easytier_proto::api;
+#[cfg(feature = "web-client")]
+pub use easytier_proto::web;
+pub use easytier_proto::{
+    ALL_DESCRIPTOR_BYTES, acl, common, core_config, error, peer_rpc, rpc_types,
+};
 
-pub mod acl;
-pub mod api;
-pub mod common;
-pub mod error;
-pub mod magic_dns;
-pub mod peer_rpc;
-pub mod web;
+#[cfg(feature = "magic-dns")]
+pub use easytier_proto::magic_dns;
 
 #[cfg(test)]
 pub mod tests;
 
-const DESCRIPTOR_POOL_BYTES: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/file_descriptor_set.bin"));
+pub mod rpc;

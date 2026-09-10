@@ -6,18 +6,19 @@ use cidr::{Ipv4Inet, Ipv6Inet};
 use std::{
     io,
     net::{Ipv4Addr, Ipv6Addr},
-    ptr::null_mut,
 };
-use windows_sys::Win32::{
+use windows::Win32::NetworkManagement::IpHelper::INTERNAL_IF_OPER_STATUS;
+use windows::Win32::{
     Foundation::NO_ERROR,
-    NetworkManagement::IpHelper::{GetIfEntry, SetIfEntry, MIB_IFROW},
+    NetworkManagement::IpHelper::{GetIfEntry, MIB_IFROW, SetIfEntry},
     System::Diagnostics::Debug::{
-        FormatMessageW, FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS,
+        FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS, FormatMessageW,
     },
 };
+use windows::core::PWSTR;
 use winreg::{
-    enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE},
     RegKey,
+    enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE},
 };
 
 use super::{Error, IfConfiguerTrait};
@@ -32,12 +33,12 @@ fn format_win_error(error: u32) -> String {
     unsafe {
         FormatMessageW(
             flags,
-            null_mut(),
+            None,
             error,
             0,
-            buffer.as_mut_ptr(),
+            PWSTR(buffer.as_mut_ptr()),
             size,
-            null_mut(),
+            None,
         );
     }
     let str_end = buffer.iter().position(|&b| b == 0).unwrap_or(buffer.len());
@@ -100,7 +101,7 @@ impl WindowsIfConfiger {
                 dwPhysAddrLen: 0,
                 bPhysAddr: [0; 8],
                 dwAdminStatus: if up { 1 } else { 2 }, // 1 = up, 2 = down
-                dwOperStatus: 0,
+                dwOperStatus: INTERNAL_IF_OPER_STATUS(0),
                 dwLastChange: 0,
                 dwInOctets: 0,
                 dwInUcastPkts: 0,
@@ -118,8 +119,8 @@ impl WindowsIfConfiger {
                 bDescr: [0; 256],
             };
 
-            if GetIfEntry(&mut if_row) == NO_ERROR {
-                if SetIfEntry(&if_row) == NO_ERROR {
+            if GetIfEntry(&mut if_row) == NO_ERROR.0 {
+                if SetIfEntry(&if_row) == NO_ERROR.0 {
                     Ok(())
                 } else {
                     Err(anyhow::anyhow!("Failed to set interface status").into())
@@ -241,19 +242,13 @@ impl IfConfiguerTrait for WindowsIfConfiger {
     }
 
     async fn wait_interface_show(&self, name: &str) -> Result<(), Error> {
-        Ok(
-            tokio::time::timeout(std::time::Duration::from_secs(10), async move {
-                loop {
-                    if let Some(idx) = Self::get_interface_index(name) {
-                        tracing::info!(?name, ?idx, "Interface found");
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-                Ok::<(), Error>(())
-            })
-            .await??,
-        )
+        loop {
+            if let Some(idx) = Self::get_interface_index(name) {
+                tracing::info!(?name, ?idx, "Interface found");
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
     async fn set_mtu(&self, name: &str, mtu: u32) -> Result<(), Error> {
@@ -331,7 +326,7 @@ impl RegistryManager {
         r"SYSTEM\CurrentControlSet\Services\NetBT\Parameters\Interfaces\Tcpip_";
 
     pub fn reg_delete_obsoleted_items(dev_name: &str) -> io::Result<()> {
-        use winreg::{enums::HKEY_LOCAL_MACHINE, enums::KEY_ALL_ACCESS, RegKey};
+        use winreg::{RegKey, enums::HKEY_LOCAL_MACHINE, enums::KEY_ALL_ACCESS};
         let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
         let profiles_key = hklm.open_subkey_with_flags(
             "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\NetworkList\\Profiles",
@@ -405,7 +400,7 @@ impl RegistryManager {
     }
 
     pub fn reg_change_catrgory_in_profile(dev_name: &str) -> io::Result<()> {
-        use winreg::{enums::HKEY_LOCAL_MACHINE, enums::KEY_ALL_ACCESS, RegKey};
+        use winreg::{RegKey, enums::HKEY_LOCAL_MACHINE, enums::KEY_ALL_ACCESS};
         let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
         let profiles_key = hklm.open_subkey_with_flags(
             "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\NetworkList\\Profiles",
@@ -448,12 +443,11 @@ impl RegistryManager {
         for guid in network_key.enum_keys().map_while(Result::ok) {
             if let Ok(guid_key) = network_key.open_subkey_with_flags(&guid, KEY_READ) {
                 // 检查 Connection/Name 是否匹配目标接口名
-                if let Ok(conn_key) = guid_key.open_subkey_with_flags("Connection", KEY_READ) {
-                    if let Ok(name) = conn_key.get_value::<String, _>("Name") {
-                        if name == interface_name {
-                            return Ok(guid);
-                        }
-                    }
+                if let Ok(conn_key) = guid_key.open_subkey_with_flags("Connection", KEY_READ)
+                    && let Ok(name) = conn_key.get_value::<String, _>("Name")
+                    && name == interface_name
+                {
+                    return Ok(guid);
                 }
             }
         }

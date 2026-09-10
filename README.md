@@ -48,39 +48,42 @@
 
 Choose the installation method that best suits your needs:
 
+Linux (Recommended):
 ```bash
-# 1. Download pre-built binary (Recommended, All platforms supported)
-# Visit https://github.com/EasyTier/EasyTier/releases
+curl -fsSL "https://github.com/EasyTier/EasyTier/blob/main/script/install.sh?raw=true" | sudo bash -s install
+```
 
-# 2. Install via cargo (Latest development version)
-cargo install --git https://github.com/EasyTier/EasyTier.git easytier
-
-# 3. Install via Docker
-# See https://easytier.cn/en/guide/installation.html#installation-methods
-
-# 4. Linux Quick Install
-wget -O- https://raw.githubusercontent.com/EasyTier/EasyTier/main/script/install.sh | sudo bash -s install
-
-# 5. MacOS via Homebrew
+Homebrew (MacOS/Linux):
+```bash
 brew tap brewforge/chinese
 brew install --cask easytier-gui
-
-# 6. OpenWrt Luci Web UI
-# Visit https://github.com/EasyTier/luci-app-easytier
-
-# 7. (Optional) Install shell completions:
-easytier-core --gen-autocomplete fish > ~/.config/fish/completions/easytier-core.fish
-easytier-cli gen-autocomplete fish > ~/.config/fish/completions/easytier-cli.fish
-
 ```
+
+Windows (Recommended, run with administrator privileges):
+```powershell
+irm "https://github.com/EasyTier/EasyTier/blob/main/script/install.ps1?raw=true" | iex
+```
+
+Install via cargo (Latest development version): 
+```bash
+cargo install --git https://github.com/EasyTier/EasyTier.git easytier
+```
+
+[Install pre-built binary](https://github.com/EasyTier/EasyTier/releases) (Recommended, All platforms supported)
+
+[Install via Docker](https://easytier.cn/en/guide/installation.html#installation-methods)
+
+[Install OpenWrt ipk package](https://github.com/EasyTier/luci-app-easytier)
+
+Additional steps:
+
+[One-Click Register Service](https://easytier.cn/en/guide/network/oneclick-install-as-service.html) (Automatically start when the system boots and run in the background)
 
 ### 🚀 Basic Usage
 
 #### Quick Networking with Shared Nodes
 
 EasyTier supports quick networking using shared public nodes. When you don't have a public IP, you can use the free shared nodes provided by the EasyTier community. Nodes will automatically attempt NAT traversal and establish P2P connections. When P2P fails, data will be relayed through shared nodes.
-
-The currently deployed shared public node is `tcp://public.easytier.cn:11010`.
 
 When using shared nodes, each node entering the network needs to provide the same `--network-name` and `--network-secret` parameters as the unique identifier of the network.
 
@@ -90,14 +93,14 @@ Taking two nodes as an example (Please use more complex network name to avoid co
 
 ```bash
 # Run with administrator privileges
-sudo easytier-core -d --network-name abc --network-secret abc -p tcp://public.easytier.cn:11010
+sudo easytier-core -d --network-name abc --network-secret abc -p tcp://<SharedNodeIP>:11010
 ```
 
 2. Run on Node B:
 
 ```bash
 # Run with administrator privileges
-sudo easytier-core -d --network-name abc --network-secret abc -p tcp://public.easytier.cn:11010
+sudo easytier-core -d --network-name abc --network-secret abc -p tcp://<SharedNodeIP>:11010
 ```
 
 After successful execution, you can check the network status using `easytier-cli`:
@@ -105,9 +108,9 @@ After successful execution, you can check the network status using `easytier-cli
 ```text
 | ipv4         | hostname       | cost  | lat_ms | loss_rate | rx_bytes | tx_bytes | tunnel_proto | nat_type | id         | version         |
 | ------------ | -------------- | ----- | ------ | --------- | -------- | -------- | ------------ | -------- | ---------- | --------------- |
-| 10.126.126.1 | abc-1          | Local | *      | *         | *        | *        | udp          | FullCone | 439804259  | 2.4.5-70e69a38~ |
-| 10.126.126.2 | abc-2          | p2p   | 3.452  | 0         | 17.33 kB | 20.42 kB | udp          | FullCone | 390879727  | 2.4.5-70e69a38~ |
-|              | PublicServer_a | p2p   | 27.796 | 0.000     | 50.01 kB | 67.46 kB | tcp          | Unknown  | 3771642457 | 2.4.5-70e69a38~ |
+| 10.126.126.1 | abc-1          | Local | *      | *         | *        | *        | udp          | FullCone | 439804259  | 2.6.2-70e69a38~ |
+| 10.126.126.2 | abc-2          | p2p   | 3.452  | 0         | 17.33 kB | 20.42 kB | udp          | FullCone | 390879727  | 2.6.2-70e69a38~ |
+|              | PublicServer_a | p2p   | 27.796 | 0.000     | 50.01 kB | 67.46 kB | tcp          | Unknown  | 3771642457 | 2.6.2-70e69a38~ |
 ```
 
 You can test connectivity between nodes:
@@ -124,7 +127,7 @@ To improve availability, you can connect to multiple shared nodes simultaneously
 
 ```bash
 # Connect to multiple shared nodes
-sudo easytier-core -d --network-name abc --network-secret abc -p tcp://public.easytier.cn:11010 -p udp://public.easytier.cn:11010
+sudo easytier-core -d --network-name abc --network-secret abc -p tcp://<SharedNodeIP1>:11010 -p udp://<SharedNodeIP2>:11010
 ```
 
 Once your network is set up successfully, you can easily configure it to start automatically on system boot. Refer to the [One-Click Register Service guide](https://easytier.cn/en/guide/network/oneclick-install-as-service.html) for step-by-step instructions on registering EasyTier as a system service.
@@ -249,8 +252,12 @@ ios <-.-> nodea <--> nodeb <-.-> id1
 1. Start EasyTier with WireGuard portal enabled:
 
 ```bash
-# Listen on 0.0.0.0:11013 and use 10.14.14.0/24 subnet for WireGuard clients
-sudo easytier-core -i 10.144.144.1 --vpn-portal wg://0.0.0.0:11013/10.14.14.0/24
+# Register one WireGuard client as virtual peer 10.144.144.3
+sudo easytier-core -i 10.144.144.1 \
+  --network-secret portal-secret \
+  --vpn-portal wg://0.0.0.0:11013 \
+  --vpn-portal-private-key "$(wg genkey)" \
+  --vpn-portal-client phone=10.144.144.3
 ```
 
 2. Get WireGuard client configuration:
@@ -260,10 +267,10 @@ sudo easytier-core -i 10.144.144.1 --vpn-portal wg://0.0.0.0:11013/10.14.14.0/24
 easytier-cli vpn-portal
 ```
 
-3. In the output configuration:
-   - Set `Interface.Address` to an available IP from the WireGuard subnet
-   - Set `Peer.Endpoint` to the public IP/domain of your EasyTier node
-   - Import the modified configuration into your WireGuard client
+3. In the output configuration, replace a wildcard `Peer.Endpoint` with the
+   public IP/domain of your EasyTier node, then import it. `Interface.Address`
+   is local to that WireGuard client and may be changed to any IPv4 address;
+   EasyTier translates it to the registered virtual-peer address.
 
 #### Self-Hosted Public Shared Node
 
@@ -292,6 +299,12 @@ sudo easytier-core --network-name mysharednode --network-secret mysharednode
 ## License
 
 EasyTier is released under the [LGPL-3.0](https://github.com/EasyTier/EasyTier/blob/main/LICENSE).
+
+## Responsible Use
+
+Use EasyTier only for lawful purposes and in compliance with applicable laws
+and regulations. You are responsible for ensuring that you are authorized to
+connect to and administer the networks and devices involved.
 
 ## Sponsor
 

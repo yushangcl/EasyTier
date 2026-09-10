@@ -1,18 +1,24 @@
 <script setup lang="ts">
+import { v4 as uuidv4 } from 'uuid'
+import { AutoComplete, Button, Checkbox, Dialog, Divider, InputNumber, InputText, MultiSelect, Panel, Password, SelectButton, ToggleButton } from 'primevue'
 import InputGroup from 'primevue/inputgroup'
 import InputGroupAddon from 'primevue/inputgroupaddon'
-import { SelectButton, Checkbox, InputText, InputNumber, AutoComplete, Panel, Divider, ToggleButton, Button, Password, Dialog } from 'primevue'
 import {
   addRow,
   DEFAULT_NETWORK_CONFIG,
   NetworkConfig,
-  NetworkingMethod,
-  removeRow
+  normalizeNetworkConfig,
+  removeRow,
+  type VpnPortalClientConfig,
+  type VpnPortalConfig,
 } from '../types/network'
-import { defineProps, defineEmits, ref, onMounted, onUnmounted } from 'vue'
+import { computed, ref, onMounted, onUnmounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+import AclManager from './acl/AclManager.vue'
+import UrlListInput from './UrlListInput.vue'
 
 const props = defineProps<{
+  actionLabel?: string
   configInvalid?: boolean
   hostname?: string
 }>()
@@ -26,64 +32,24 @@ const curNetwork = defineModel('curNetwork', {
 
 const { t } = useI18n()
 
-const networking_methods = ref([
-  { value: NetworkingMethod.PublicServer, label: () => t('public_server') },
-  { value: NetworkingMethod.Manual, label: () => t('manual') },
-  { value: NetworkingMethod.Standalone, label: () => t('standalone') },
-])
-
-const protos: { [proto: string]: number } = { tcp: 11010, udp: 11010, wg: 11011, ws: 11011, wss: 11012 }
-
-function searchUrlSuggestions(e: { query: string }): string[] {
-  const query = e.query
-  const ret = []
-  // if query match "^\w+:.*", then no proto prefix
-  if (query.match(/^\w+:.*/)) {
-    // if query is a valid url, then add to suggestions
-    try {
-      // eslint-disable-next-line no-new
-      new URL(query)
-      ret.push(query)
-    }
-    catch { }
-  }
-  else {
-    for (const proto in protos) {
-      let item = `${proto}://${query}`
-      // if query match ":\d+$", then no port suffix
-      if (!query.match(/:\d+$/)) {
-        item += `:${protos[proto]}`
-      }
-      ret.push(item)
-    }
-  }
-
-  return ret
+const protos: { [proto: string]: number } = {
+  tcp: 11010,
+  udp: 11010,
+  wg: 11011,
+  ws: 11011,
+  wss: 11012,
+  quic: 11012,
+  faketcp: 11013,
+  http: 80,
+  https: 443,
+  txt: 0,
+  srv: 0,
 }
 
-const publicServerSuggestions = ref([''])
-
-function searchPresetPublicServers(e: { query: string }) {
-  const presetPublicServers = [
-    'tcp://public.easytier.top:11010',
-  ]
-
-  const query = e.query
-  // if query is sub string of presetPublicServers, add to suggestions
-  let ret = presetPublicServers.filter(item => item.includes(query))
-  // add additional suggestions
-  if (query.length > 0) {
-    ret = ret.concat(searchUrlSuggestions(e))
-  }
-
-  publicServerSuggestions.value = ret
-}
-
-const peerSuggestions = ref([''])
-
-function searchPeerSuggestions(e: { query: string }) {
-  peerSuggestions.value = searchUrlSuggestions(e)
-}
+const listenerExcludedProtos = new Set(['http', 'https', 'txt', 'srv'])
+const listenerProtos: { [proto: string]: number } = Object.fromEntries(
+  Object.entries(protos).filter(([proto]) => !listenerExcludedProtos.has(proto))
+)
 
 const inetSuggestions = ref([''])
 
@@ -98,34 +64,6 @@ function searchInetSuggestions(e: { query: string }) {
     inetSuggestions.value = ret
   }
 }
-
-const listenerSuggestions = ref([''])
-
-function searchListenerSuggestions(e: { query: string }) {
-  const ret = []
-
-  for (const proto in protos) {
-    let item = `${proto}://0.0.0.0:`
-    // if query is a number, use it as port
-    if (e.query.match(/^\d+$/)) {
-      item += e.query
-    }
-    else {
-      item += protos[proto]
-    }
-
-    if (item.includes(e.query)) {
-      ret.push(item)
-    }
-  }
-
-  if (ret.length === 0) {
-    ret.push(e.query)
-  }
-
-  listenerSuggestions.value = ret
-}
-
 
 const exitNodesSuggestions = ref([''])
 
@@ -152,20 +90,26 @@ const bool_flags: BoolFlag[] = [
   { field: 'latency_first', help: 'latency_first_help' },
   { field: 'use_smoltcp', help: 'use_smoltcp_help' },
   { field: 'disable_ipv6', help: 'disable_ipv6_help' },
+  { field: 'ipv6_public_addr_auto', help: 'ipv6_public_addr_auto_help' },
   { field: 'enable_kcp_proxy', help: 'enable_kcp_proxy_help' },
   { field: 'disable_kcp_input', help: 'disable_kcp_input_help' },
   { field: 'enable_quic_proxy', help: 'enable_quic_proxy_help' },
   { field: 'disable_quic_input', help: 'disable_quic_input_help' },
   { field: 'disable_p2p', help: 'disable_p2p_help' },
   { field: 'p2p_only', help: 'p2p_only_help' },
+  { field: 'lazy_p2p', help: 'lazy_p2p_help' },
   { field: 'bind_device', help: 'bind_device_help' },
   { field: 'no_tun', help: 'no_tun_help' },
   { field: 'enable_exit_node', help: 'enable_exit_node_help' },
   { field: 'relay_all_peer_rpc', help: 'relay_all_peer_rpc_help' },
+  { field: 'need_p2p', help: 'need_p2p_help' },
   { field: 'multi_thread', help: 'multi_thread_help' },
   { field: 'proxy_forward_by_system', help: 'proxy_forward_by_system_help' },
   { field: 'disable_encryption', help: 'disable_encryption_help' },
+  { field: 'disable_tcp_hole_punching', help: 'disable_tcp_hole_punching_help' },
   { field: 'disable_udp_hole_punching', help: 'disable_udp_hole_punching_help' },
+  { field: 'enable_udp_broadcast_relay', help: 'enable_udp_broadcast_relay_help' },
+  { field: 'disable_upnp', help: 'disable_upnp_help' },
   { field: 'disable_sym_hole_punching', help: 'disable_sym_hole_punching_help' },
   { field: 'enable_magic_dns', help: 'enable_magic_dns_help' },
   { field: 'enable_private_mode', help: 'enable_private_mode_help' },
@@ -199,6 +143,7 @@ function savePortForward() {
 const portForwardContainer = ref<HTMLElement | null>(null);
 const isCompact = ref(false);
 
+const UINT64_MAX = (1n << 64n) - 1n
 
 onMounted(() => {
   if (portForwardContainer.value) {
@@ -216,6 +161,95 @@ onMounted(() => {
     });
   }
 });
+
+function syncNormalizedNetwork(network: NetworkConfig | undefined): void {
+  if (!network) {
+    return
+  }
+
+  Object.assign(network, normalizeNetworkConfig(network))
+}
+
+watch(() => curNetwork.value, syncNormalizedNetwork, { immediate: true, deep: false })
+
+function parseInstanceRecvBpsLimitInput(value: string): number | string | null | undefined {
+  const trimmed = value.trim()
+  if (trimmed.length === 0) {
+    return null
+  }
+  if (!/^\d+$/.test(trimmed)) {
+    return undefined
+  }
+
+  const limit = BigInt(trimmed)
+  if (limit === 0n) {
+    return null
+  }
+  if (limit > UINT64_MAX) {
+    return undefined
+  }
+
+  return limit <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(limit) : limit.toString()
+}
+
+const instanceRecvBpsLimitInput = computed<string>({
+  get: () => {
+    const limit = curNetwork.value.instance_recv_bps_limit
+    return limit == null ? '' : String(limit)
+  },
+  set: (value) => {
+    const limit = parseInstanceRecvBpsLimitInput(value)
+    if (limit !== undefined) {
+      curNetwork.value.instance_recv_bps_limit = limit
+    }
+  },
+})
+
+function defaultVpnPortalConfig(): VpnPortalConfig {
+  return {
+    wireguard_listen: '0.0.0.0:22022',
+    clients: [],
+  }
+}
+
+const vpnPortalEnabled = computed({
+  get: () => curNetwork.value.vpn_portal_config !== undefined,
+  set: (enabled: boolean) => {
+    curNetwork.value.vpn_portal_config = enabled ? defaultVpnPortalConfig() : undefined
+  },
+})
+
+const vpnPortalConfig = computed(() => curNetwork.value.vpn_portal_config ?? defaultVpnPortalConfig())
+
+const vpnPortalPrivateKey = computed({
+  get: () => vpnPortalConfig.value.wireguard_private_key ?? '',
+  set: (value: string | null | undefined) => {
+    vpnPortalConfig.value.wireguard_private_key = value && value.length > 0 ? value : undefined
+  },
+})
+
+const vpnPortalGroupOptions = computed(() => (
+  curNetwork.value.acl?.acl_v1?.group?.declares ?? []
+).map((group) => group.group_name))
+
+const vpnPortalClientViewKeys = new WeakMap<VpnPortalClientConfig, string>()
+
+function vpnPortalClientViewKey(client: VpnPortalClientConfig): string {
+  let key = vpnPortalClientViewKeys.get(client)
+  if (!key) {
+    key = uuidv4()
+    vpnPortalClientViewKeys.set(client, key)
+  }
+  return key
+}
+
+function addVpnPortalClient() {
+  vpnPortalConfig.value.clients.push({ name: '', virtual_ip: '', groups: [] })
+}
+
+function removeVpnPortalClient(index: number) {
+  vpnPortalConfig.value.clients.splice(index, 1)
+}
 </script>
 
 <template>
@@ -256,23 +290,20 @@ onMounted(() => {
                 <div class="flex flex-col gap-2 basis-5/12 grow">
                   <label for="network_secret">{{ t('network_secret') }}</label>
                   <Password id="network_secret" v-model="curNetwork.network_secret"
-                    aria-describedby="network_secret-help" toggleMask :feedback="false" />
+                    aria-describedby="network_secret-help" toggleMask :feedback="false" fluid />
                 </div>
               </div>
 
               <div class="flex flex-row gap-x-9 flex-wrap">
                 <div class="flex flex-col gap-2 basis-5/12 grow">
-                  <label for="nm">{{ t('networking_method') }}</label>
-                  <SelectButton v-model="curNetwork.networking_method" :options="networking_methods"
-                    :option-label="(v) => v.label()" option-value="value" />
-                  <div class="items-center flex flex-row p-fluid gap-x-1">
-                    <AutoComplete v-if="curNetwork.networking_method === NetworkingMethod.Manual" id="chips"
-                      v-model="curNetwork.peer_urls" :placeholder="t('chips_placeholder', ['tcp://8.8.8.8:11010'])"
-                      class="grow" multiple fluid :suggestions="peerSuggestions" @complete="searchPeerSuggestions" />
-
-                    <AutoComplete v-if="curNetwork.networking_method === NetworkingMethod.PublicServer"
-                      v-model="curNetwork.public_server_url" :suggestions="publicServerSuggestions" class="grow"
-                      dropdown :complete-on-focus="false" @complete="searchPresetPublicServers" />
+                  <div class="flex items-center">
+                    <label for="initial_nodes">{{ t('initial_nodes') }}</label>
+                    <span class="pi pi-question-circle ml-2 self-center" v-tooltip="t('initial_nodes_help')"></span>
+                  </div>
+                  <div class="items-center flex flex-col p-fluid gap-y-2">
+                    <UrlListInput id="initial_nodes" v-model="curNetwork.peer_urls" :protos="protos"
+                      defaultUrl="tcp://:11010" :add-label="t('add_initial_node')"
+                      :placeholder="t('initial_node_placeholder')" />
                   </div>
                 </div>
               </div>
@@ -318,24 +349,56 @@ onMounted(() => {
 
               <div class="flex flex-row gap-x-9 flex-wrap ">
                 <div class="flex flex-col gap-2 grow">
-                  <label for="username">VPN Portal</label>
-                  <ToggleButton v-model="curNetwork.enable_vpn_portal" on-icon="pi pi-check" off-icon="pi pi-times"
+                  <label>VPN Portal</label>
+                  <ToggleButton v-model="vpnPortalEnabled" on-icon="pi pi-check" off-icon="pi pi-times"
                     :on-label="t('off_text')" :off-label="t('on_text')" class="w-48" />
-                  <div v-if="curNetwork.enable_vpn_portal" class="items-center flex flex-row gap-x-4">
-                    <div class="flex flex-row gap-x-9 flex-wrap w-full">
-                      <div class="flex flex-col gap-2 basis-8/12 grow">
-                        <InputGroup>
-                          <InputText v-model="curNetwork.vpn_portal_client_network_addr"
-                            :placeholder="t('vpn_portal_client_network')" />
-                          <InputGroupAddon>
-                            <span>/{{ curNetwork.vpn_portal_client_network_len }}</span>
-                          </InputGroupAddon>
-                        </InputGroup>
+                  <div v-if="vpnPortalEnabled" class="flex flex-col gap-3 w-full">
+                    <div class="flex flex-row gap-x-9 gap-y-3 flex-wrap w-full">
+                      <div class="flex flex-col gap-2 basis-5/12 grow">
+                        <label for="vpn_portal_wireguard_listen">{{ t('vpn_portal_wireguard_listen') }}</label>
+                        <InputText id="vpn_portal_wireguard_listen" v-model="vpnPortalConfig.wireguard_listen"
+                          :placeholder="t('vpn_portal_wireguard_listen_placeholder')" />
                       </div>
-                      <div class="flex flex-col gap-2 basis-3/12 grow">
-                        <InputNumber v-model="curNetwork.vpn_portal_listen_port" :allow-empty="false" :format="false"
-                          :min="0" :max="65535" fluid />
+                      <div class="flex flex-col gap-2 basis-5/12 grow">
+                        <label for="vpn_portal_wireguard_private_key">{{ t('vpn_portal_wireguard_private_key') }}</label>
+                        <Password id="vpn_portal_wireguard_private_key"
+                          v-model="vpnPortalPrivateKey"
+                          :placeholder="t('vpn_portal_wireguard_private_key_placeholder')"
+                          toggleMask :feedback="false" fluid />
                       </div>
+                    </div>
+
+                    <div class="flex items-center justify-between gap-3">
+                      <label>{{ t('vpn_portal_clients') }}</label>
+                      <Button icon="pi pi-plus" :label="t('vpn_portal_add_client')" severity="secondary" size="small"
+                        :disabled="vpnPortalConfig.clients.length >= 64"
+                        @click="addVpnPortalClient" />
+                    </div>
+
+                    <div v-if="vpnPortalConfig.clients.length === 0"
+                      class="text-sm text-surface-500 dark:text-surface-400">
+                      {{ t('vpn_portal_no_clients') }}
+                    </div>
+                    <div v-for="(client, index) in vpnPortalConfig.clients" :key="vpnPortalClientViewKey(client)"
+                      class="flex flex-row gap-3 flex-wrap items-end rounded border border-surface-200 dark:border-surface-700 p-3">
+                      <div class="flex flex-col gap-2 grow basis-3/12">
+                        <label :for="`vpn_portal_client_name_${index}`">{{ t('vpn_portal_client_name') }}</label>
+                        <InputText :id="`vpn_portal_client_name_${index}`" v-model="client.name"
+                          :placeholder="t('vpn_portal_client_name_placeholder')" />
+                      </div>
+                      <div class="flex flex-col gap-2 grow basis-3/12">
+                        <label :for="`vpn_portal_client_virtual_ip_${index}`">{{ t('vpn_portal_client_virtual_ip') }}</label>
+                        <InputText :id="`vpn_portal_client_virtual_ip_${index}`" v-model="client.virtual_ip"
+                          :placeholder="t('vpn_portal_client_virtual_ip_placeholder')" />
+                      </div>
+                      <div class="flex flex-col gap-2 grow basis-4/12">
+                        <label :for="`vpn_portal_client_groups_${index}`">{{ t('vpn_portal_client_groups') }}</label>
+                        <MultiSelect :input-id="`vpn_portal_client_groups_${index}`" v-model="client.groups"
+                          :options="vpnPortalGroupOptions" appendTo="self" filter fluid
+                          :placeholder="t('vpn_portal_client_groups_placeholder')" />
+                      </div>
+                      <Button icon="pi pi-trash" severity="danger" text rounded
+                        :aria-label="t('vpn_portal_remove_client')" @click="removeVpnPortalClient(index)" />
                     </div>
                   </div>
                 </div>
@@ -344,10 +407,8 @@ onMounted(() => {
               <div class="flex flex-row gap-x-9 flex-wrap">
                 <div class="flex flex-col gap-2 grow p-fluid">
                   <label for="listener_urls">{{ t('listener_urls') }}</label>
-                  <AutoComplete id="listener_urls" v-model="curNetwork.listener_urls" :suggestions="listenerSuggestions"
-                    class="w-full" dropdown :complete-on-focus="true"
-                    :placeholder="t('chips_placeholder', ['tcp://1.1.1.1:11010'])" multiple
-                    @complete="searchListenerSuggestions" />
+                  <UrlListInput v-model="curNetwork.listener_urls" :protos="listenerProtos"
+                    :add-label="t('add_listener_url')" placeholder="0.0.0.0" />
                 </div>
               </div>
 
@@ -367,6 +428,19 @@ onMounted(() => {
                   </div>
                   <InputNumber id="mtu" v-model="curNetwork.mtu" aria-describedby="mtu-help" :format="false"
                     :placeholder="t('mtu_placeholder')" :min="400" :max="1380" fluid />
+                </div>
+              </div>
+
+              <div class="flex flex-row gap-x-9 flex-wrap">
+                <div class="flex flex-col gap-2 basis-5/12 grow">
+                  <div class="flex">
+                    <label for="instance_recv_bps_limit">{{ t('instance_recv_bps_limit') }}</label>
+                    <span class="pi pi-question-circle ml-2 self-center"
+                      v-tooltip="t('instance_recv_bps_limit_help')"></span>
+                  </div>
+                  <InputText id="instance_recv_bps_limit" v-model="instanceRecvBpsLimitInput"
+                    aria-describedby="instance_recv_bps_limit-help" inputmode="numeric" pattern="[0-9]*"
+                    :placeholder="t('instance_recv_bps_limit_placeholder')" fluid />
                 </div>
               </div>
 
@@ -442,9 +516,8 @@ onMounted(() => {
                     <label for="mapped_listeners">{{ t('mapped_listeners') }}</label>
                     <span class="pi pi-question-circle ml-2 self-center" v-tooltip="t('mapped_listeners_help')"></span>
                   </div>
-                  <AutoComplete id="mapped_listeners" v-model="curNetwork.mapped_listeners"
-                    :placeholder="t('chips_placeholder', ['tcp://123.123.123.123:11223'])" class="w-full" multiple fluid
-                    :suggestions="peerSuggestions" @complete="searchPeerSuggestions" />
+                  <UrlListInput v-model="curNetwork.mapped_listeners" :protos="protos"
+                    :add-label="t('add_mapped_listener')" />
                 </div>
               </div>
 
@@ -540,8 +613,20 @@ onMounted(() => {
             </div>
           </Panel>
 
+          <Divider />
+
+          <Panel :header="t('acl.title')" toggleable collapsed>
+            <div v-if="curNetwork.acl" class="flex flex-col gap-y-2">
+              <AclManager v-model="curNetwork.acl" />
+            </div>
+            <div v-else class="flex justify-center p-4">
+              <Button :label="t('acl.enabled')"
+                @click="curNetwork.acl = { acl_v1: { chains: [], group: { declares: [], members: [] } } }" />
+            </div>
+          </Panel>
+
           <div class="flex pt-6 justify-center">
-            <Button :label="t('run_network')" icon="pi pi-arrow-right" icon-pos="right" :disabled="configInvalid"
+            <Button :label="actionLabel || t('run_network')" icon="pi pi-arrow-right" icon-pos="right" :disabled="configInvalid"
               @click="$emit('runNetwork', curNetwork)" />
           </div>
         </div>

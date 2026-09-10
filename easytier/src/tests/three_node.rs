@@ -3,12 +3,22 @@
 use core::panic;
 use std::{
     future::Future,
-    sync::{atomic::AtomicU32, Arc},
+    sync::{Arc, atomic::AtomicU32},
     time::Duration,
 };
 
-use rand::Rng;
+#[cfg(feature = "wireguard")]
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use easytier_core::{
+    connectivity::protocol::raw::TunnelDialer,
+    foundation::stats::{LabelSet, LabelType, MetricName, MetricSnapshot},
+    process_runtime::CoreProcessRuntime,
+    socket::SocketListener,
+    tunnel::Tunnel,
+};
+use rand::{Rng, rngs::OsRng};
 use tokio::{net::UdpSocket, task::JoinSet};
+use x25519_dalek::StaticSecret;
 
 use super::*;
 
@@ -18,23 +28,90 @@ use crate::{
     common::{
         config::{ConfigLoader, NetworkIdentity, PortForwardConfig, TomlConfigLoader},
         netns::{NetNS, ROOT_NETNS_NAME},
-        stats_manager::{LabelType, MetricName},
     },
-    instance::instance::Instance,
-    proto::{api::instance::TcpProxyEntryTransportType, common::CompressionAlgoPb},
-    tunnel::{
-        common::tests::{_tunnel_bench_netns, wait_for_condition},
-        ring::RingTunnelConnector,
-        tcp::{TcpTunnelConnector, TcpTunnelListener},
-        udp::UdpTunnelConnector,
+    instance::config::test_runtime_instance_config,
+    instance::test_instance::TestInstance as Instance,
+    proto::{
+        api::instance::TcpProxyEntryTransportType,
+        common::{CompressionAlgoPb, SecureModeConfig},
+        rpc::standalone::{
+            RuntimeRpcDialer, RuntimeRpcListener, runtime_rpc_dialer, runtime_rpc_listener,
+            runtime_udp_tunnel_dialer, runtime_udp_tunnel_listener,
+        },
+    },
+    tunnel::common::tests::{
+        _tunnel_bench_netns, _tunnel_pingpong_netns_with_timeout, wait_for_condition,
     },
 };
 
+fn metric_value(metrics: &[MetricSnapshot], name: MetricName, labels: &LabelSet) -> Option<u64> {
+    metrics
+        .iter()
+        .find(|metric| metric.name == name && metric.labels == *labels)
+        .map(|metric| metric.value)
+}
+
+fn core_tcp_listener(url: url::Url) -> RuntimeRpcListener {
+    let addr = url
+        .socket_addrs(|| Some(11010))
+        .expect("test TCP listener URL should resolve")
+        .into_iter()
+        .next()
+        .expect("test TCP listener URL should have an address");
+    runtime_rpc_listener(addr)
+}
+
+fn core_tcp_dialer(url: url::Url) -> RuntimeRpcDialer {
+    runtime_rpc_dialer(url)
+}
+
+fn core_udp_listener(url: url::Url) -> impl SocketListener<Accepted = Box<dyn Tunnel>> + Sync {
+    let addr = url
+        .socket_addrs(|| Some(11010))
+        .expect("test UDP listener URL should resolve")
+        .into_iter()
+        .next()
+        .expect("test UDP listener URL should have an address");
+    runtime_udp_tunnel_listener(url, addr)
+}
+
+fn core_udp_dialer(url: url::Url) -> impl TunnelDialer {
+    runtime_udp_tunnel_dialer(url)
+}
+
+async fn reload_instance_acl(inst: &Instance, acl: Option<&crate::proto::acl::Acl>) {
+    let mut config = test_runtime_instance_config(&inst.get_global_ctx());
+    config.services.acl = easytier_core::config::peers::AclRuleConfig {
+        acl: acl.cloned(),
+        ..Default::default()
+    };
+    inst.get_core_instance()
+        .update_runtime_config(config)
+        .await
+        .unwrap();
+}
+
+async fn set_foreign_network_refresh_interval(inst: &Instance, seconds: u64) {
+    let mut config = test_runtime_instance_config(&inst.get_global_ctx());
+    Arc::make_mut(&mut config.peer).ospf_update_my_foreign_network_interval_sec = seconds;
+    inst.get_core_instance()
+        .update_runtime_config(config)
+        .await
+        .unwrap();
+}
+
 #[cfg(feature = "wireguard")]
 use crate::{
-    common::config::VpnPortalConfig,
-    tunnel::wireguard::{WgConfig, WgTunnelConnector},
-    vpn_portal::wireguard::get_wg_config_for_portal,
+    common::config::{VpnPortalClientConfig, VpnPortalConfig},
+    vpn_portal::wireguard::test_wireguard_keys,
+};
+
+#[cfg(feature = "wireguard")]
+use easytier_core::gateway::vpn_portal::PortalClientState;
+#[cfg(feature = "wireguard")]
+use easytier_proto::api::{
+    config::{ConfigPatchAction, InstanceConfigPatch, VpnPortalClientPatch},
+    manage::VpnPortalClientConfig as VpnPortalClientConfigPb,
 };
 
 pub fn prepare_linux_namespaces() {
@@ -42,19 +119,25 @@ pub fn prepare_linux_namespaces() {
     del_netns("net_b");
     del_netns("net_c");
     del_netns("net_d");
+    del_netns("net_e");
+    del_netns("net_f");
 
     create_netns("net_a", "10.1.1.1/24", "fd11::1/64");
     create_netns("net_b", "10.1.1.2/24", "fd11::2/64");
     create_netns("net_c", "10.1.2.3/24", "fd12::3/64");
     create_netns("net_d", "10.1.2.4/24", "fd12::4/64");
+    create_netns("net_e", "10.1.1.3/24", "fd11::3/64");
+    create_netns("net_f", "10.1.2.5/24", "fd12::5/64");
 
     prepare_bridge("br_a");
     prepare_bridge("br_b");
 
     add_ns_to_bridge("br_a", "net_a");
     add_ns_to_bridge("br_a", "net_b");
+    add_ns_to_bridge("br_a", "net_e");
     add_ns_to_bridge("br_b", "net_c");
     add_ns_to_bridge("br_b", "net_d");
+    add_ns_to_bridge("br_b", "net_f");
 }
 
 pub fn get_inst_config(
@@ -80,100 +163,95 @@ pub fn get_inst_config(
 }
 
 pub async fn init_three_node(proto: &str) -> Vec<Instance> {
-    init_three_node_ex(proto, |cfg| cfg, false).await
+    init_three_node_with_process_runtime(proto, CoreProcessRuntime::new()).await
 }
 
-pub async fn init_three_node_ex<F: Fn(TomlConfigLoader) -> TomlConfigLoader>(
+async fn init_three_node_with_process_runtime(
+    proto: &str,
+    process_runtime: Arc<CoreProcessRuntime>,
+) -> Vec<Instance> {
+    init_three_node_ex_with_inst3(
+        proto,
+        |cfg| cfg,
+        false,
+        "net_c",
+        "10.144.144.3",
+        "fd00::3/64",
+        process_runtime,
+    )
+    .await
+}
+
+async fn init_three_node_ex_with_inst3<F: Fn(TomlConfigLoader) -> TomlConfigLoader>(
     proto: &str,
     cfg_cb: F,
     use_public_server: bool,
+    inst3_ns: &str,
+    inst3_ipv4: &str,
+    inst3_ipv6: &str,
+    process_runtime: Arc<CoreProcessRuntime>,
 ) -> Vec<Instance> {
     prepare_linux_namespaces();
 
-    let mut inst1 = Instance::new(cfg_cb(get_inst_config(
-        "inst1",
-        Some("net_a"),
-        "10.144.144.1",
-        "fd00::1/64",
-    )));
-    let mut inst2 = Instance::new(cfg_cb(get_inst_config(
-        "inst2",
-        Some("net_b"),
-        "10.144.144.2",
-        "fd00::2/64",
-    )));
-    let mut inst3 = Instance::new(cfg_cb(get_inst_config(
-        "inst3",
-        Some("net_c"),
-        "10.144.144.3",
-        "fd00::3/64",
-    )));
+    let mut inst1 = Instance::new_with_process_runtime(
+        cfg_cb(get_inst_config(
+            "inst1",
+            Some("net_a"),
+            "10.144.144.1",
+            "fd00::1/64",
+        )),
+        process_runtime.clone(),
+    );
+    let mut inst2 = Instance::new_with_process_runtime(
+        cfg_cb(get_inst_config(
+            "inst2",
+            Some("net_b"),
+            "10.144.144.2",
+            "fd00::2/64",
+        )),
+        process_runtime.clone(),
+    );
+    let mut inst3 = Instance::new_with_process_runtime(
+        cfg_cb(get_inst_config(
+            "inst3",
+            Some(inst3_ns),
+            inst3_ipv4,
+            inst3_ipv6,
+        )),
+        process_runtime.clone(),
+    );
 
     inst1.run().await.unwrap();
     inst2.run().await.unwrap();
     inst3.run().await.unwrap();
 
     if proto == "tcp" {
-        inst1
-            .get_conn_manager()
-            .add_connector(TcpTunnelConnector::new(
-                "tcp://10.1.1.2:11010".parse().unwrap(),
-            ));
+        inst1.add_connector_url("tcp://10.1.1.2:11010".parse().unwrap());
     } else if proto == "udp" {
-        inst1
-            .get_conn_manager()
-            .add_connector(UdpTunnelConnector::new(
-                "udp://10.1.1.2:11010".parse().unwrap(),
-            ));
+        inst1.add_connector_url("udp://10.1.1.2:11010".parse().unwrap());
     } else if proto == "wg" {
         #[cfg(feature = "wireguard")]
-        inst1
-            .get_conn_manager()
-            .add_connector(WgTunnelConnector::new(
-                "wg://10.1.1.2:11011".parse().unwrap(),
-                WgConfig::new_from_network_identity(
-                    &inst2.get_global_ctx().get_network_identity().network_name,
-                    &inst2
-                        .get_global_ctx()
-                        .get_network_identity()
-                        .network_secret
-                        .unwrap_or_default(),
-                ),
-            ));
+        inst1.add_connector_url("wg://10.1.1.2:11011".parse().unwrap());
     } else if proto == "ws" {
         #[cfg(feature = "websocket")]
-        inst1
-            .get_conn_manager()
-            .add_connector(crate::tunnel::websocket::WSTunnelConnector::new(
-                "ws://10.1.1.2:11011".parse().unwrap(),
-            ));
+        inst1.add_connector_url("ws://10.1.1.2:11011".parse().unwrap());
     } else if proto == "wss" {
         #[cfg(feature = "websocket")]
-        inst1
-            .get_conn_manager()
-            .add_connector(crate::tunnel::websocket::WSTunnelConnector::new(
-                "wss://10.1.1.2:11012".parse().unwrap(),
-            ));
+        inst1.add_connector_url("wss://10.1.1.2:11012".parse().unwrap());
     }
 
-    inst3
-        .get_conn_manager()
-        .add_connector(RingTunnelConnector::new(
-            format!("ring://{}", inst2.id()).parse().unwrap(),
-        ));
+    inst3.add_connector_url(inst2.ring_listener_url());
 
     // wait inst2 have two route.
     wait_for_condition(
         || async {
             if !use_public_server {
-                inst2.get_peer_manager().list_routes().await.len() == 2
+                inst2.get_core_instance().route_snapshots().await.len() == 2
             } else {
                 inst2
-                    .get_peer_manager()
-                    .get_foreign_network_manager()
-                    .list_foreign_networks()
+                    .get_core_instance()
+                    .foreign_network_snapshots(false)
                     .await
-                    .foreign_networks
                     .len()
                     == 1
             }
@@ -184,7 +262,7 @@ pub async fn init_three_node_ex<F: Fn(TomlConfigLoader) -> TomlConfigLoader>(
 
     wait_for_condition(
         || async {
-            let routes = inst1.get_peer_manager().list_routes().await;
+            let routes = inst1.get_core_instance().route_snapshots().await;
             println!("routes: {:?}", routes);
             routes.len() == 2
         },
@@ -194,7 +272,7 @@ pub async fn init_three_node_ex<F: Fn(TomlConfigLoader) -> TomlConfigLoader>(
 
     wait_for_condition(
         || async {
-            let routes = inst3.get_peer_manager().list_routes().await;
+            let routes = inst3.get_core_instance().route_snapshots().await;
             println!("routes: {:?}", routes);
             routes.len() == 2
         },
@@ -205,19 +283,52 @@ pub async fn init_three_node_ex<F: Fn(TomlConfigLoader) -> TomlConfigLoader>(
     vec![inst1, inst2, inst3]
 }
 
+pub async fn init_three_node_ex<F: Fn(TomlConfigLoader) -> TomlConfigLoader>(
+    proto: &str,
+    cfg_cb: F,
+    use_public_server: bool,
+) -> Vec<Instance> {
+    init_three_node_ex_with_inst3(
+        proto,
+        cfg_cb,
+        use_public_server,
+        "net_c",
+        "10.144.144.3",
+        "fd00::3/64",
+        CoreProcessRuntime::new(),
+    )
+    .await
+}
+
+async fn init_lazy_p2p_three_node_ex<F: Fn(TomlConfigLoader) -> TomlConfigLoader>(
+    proto: &str,
+    cfg_cb: F,
+) -> Vec<Instance> {
+    init_three_node_ex_with_inst3(
+        proto,
+        cfg_cb,
+        false,
+        "net_e",
+        "10.144.144.3",
+        "fd00::3/64",
+        CoreProcessRuntime::new(),
+    )
+    .await
+}
+
 pub async fn drop_insts(insts: Vec<Instance>) {
     let mut set = JoinSet::new();
     for mut inst in insts {
         set.spawn(async move {
             inst.clear_resources().await;
-            let pm = Arc::downgrade(&inst.get_peer_manager());
+            let core = Arc::downgrade(&inst.get_core_instance());
             drop(inst);
             let now = std::time::Instant::now();
-            while now.elapsed().as_secs() < 5 && pm.strong_count() > 0 {
+            while now.elapsed().as_secs() < 5 && core.strong_count() > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
 
-            debug_assert_eq!(pm.strong_count(), 0, "PeerManager should be dropped");
+            debug_assert_eq!(core.strong_count(), 0, "CoreInstance should be dropped");
         });
     }
     while set.join_next().await.is_some() {}
@@ -271,6 +382,641 @@ async fn ping6_test(from_netns: &str, target_ip: &str, payload_size: Option<usiz
     code.code().unwrap() == 0
 }
 
+fn run_cmd(program: &str, args: &[&str]) {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{} {:?} failed: stdout={}, stderr={}",
+        program,
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn run_cmd_output(program: &str, args: &[&str]) -> String {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{} {:?} failed: stdout={}, stderr={}",
+        program,
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn run_ip(args: &[&str]) {
+    run_cmd("ip", args);
+}
+
+fn run_ip_in_ns(ns: &str, args: &[&str]) {
+    let mut cmd = vec!["netns", "exec", ns, "ip"];
+    cmd.extend_from_slice(args);
+    run_cmd("ip", &cmd);
+}
+
+fn run_ip_in_ns_output(ns: &str, args: &[&str]) -> String {
+    let mut cmd = vec!["netns", "exec", ns, "ip"];
+    cmd.extend_from_slice(args);
+    run_cmd_output("ip", &cmd)
+}
+
+fn run_sysctl_in_ns(ns: &str, assignment: &str) {
+    run_cmd("ip", &["netns", "exec", ns, "sysctl", "-qw", assignment]);
+}
+
+fn create_empty_netns(name: &str) {
+    del_netns(name);
+    run_ip(&["netns", "add", name]);
+    run_ip(&["netns", "exec", name, "ip", "link", "set", "lo", "up"]);
+}
+
+fn connect_ns_to_bridge(ns: &str, guest_if: &str, host_if: &str, bridge: &str) {
+    let _ = std::process::Command::new("ip")
+        .args(["link", "del", host_if])
+        .status();
+    run_ip(&[
+        "link", "add", host_if, "type", "veth", "peer", "name", guest_if,
+    ]);
+    run_ip(&["link", "set", guest_if, "netns", ns]);
+    run_ip(&["link", "set", host_if, "up"]);
+    run_cmd("brctl", &["addif", bridge, host_if]);
+    run_ip(&["netns", "exec", ns, "ip", "link", "set", guest_if, "up"]);
+}
+
+struct PublicIpv6Lab {
+    extra_namespaces: [&'static str; 2],
+    extra_bridges: [&'static str; 2],
+}
+
+#[derive(Clone, Copy)]
+enum PublicIpv6LabTopology {
+    DelegatedPrefix,
+    OnLinkPrefix,
+}
+
+impl PublicIpv6Lab {
+    const PROVIDER_NS: &'static str = "net_a";
+    const CLIENT_NS: &'static str = "net_b";
+    const UPSTREAM_NS: &'static str = "net_pubgw";
+    const SERVER_NS: &'static str = "net_pubsrv";
+    const WAN_BRIDGE: &'static str = "br_pubwan";
+    const SERVER_BRIDGE: &'static str = "br_pubsrv";
+    const PROVIDER_TUN: &'static str = "etpubv6p";
+    const CLIENT_TUN: &'static str = "etpubv6c";
+    const PROVIDER_PREFIX: &'static str = "2001:db8:100::/64";
+    const PROVIDER_DEFAULT_FROM: &'static str = "2001:db8:100::/64";
+    const PROVIDER_WAN_ADDR: &'static str = "2001:db8:ffff:1::2/64";
+    const UPSTREAM_WAN_ADDR: &'static str = "2001:db8:ffff:1::1/64";
+    const ON_LINK_PROVIDER_WAN_ADDR: &'static str = "2001:db8:100::2/64";
+    const ON_LINK_UPSTREAM_WAN_ADDR: &'static str = "2001:db8:100::1/64";
+    const UPSTREAM_SERVER_ADDR: &'static str = "2001:db8:ffff:2::1/64";
+    const SERVER_ADDR: &'static str = "2001:db8:ffff:2::100/64";
+    const SERVER_IP: &'static str = "2001:db8:ffff:2::100";
+
+    fn setup_with_topology(topology: PublicIpv6LabTopology) -> Self {
+        prepare_linux_namespaces();
+
+        del_netns(Self::UPSTREAM_NS);
+        del_netns(Self::SERVER_NS);
+        let _ = std::process::Command::new("ip")
+            .args(["link", "del", Self::WAN_BRIDGE])
+            .status();
+        let _ = std::process::Command::new("ip")
+            .args(["link", "del", Self::SERVER_BRIDGE])
+            .status();
+        let _ = std::process::Command::new("brctl")
+            .args(["delbr", Self::WAN_BRIDGE])
+            .status();
+        let _ = std::process::Command::new("brctl")
+            .args(["delbr", Self::SERVER_BRIDGE])
+            .status();
+
+        create_empty_netns(Self::UPSTREAM_NS);
+        create_empty_netns(Self::SERVER_NS);
+        prepare_bridge(Self::WAN_BRIDGE);
+        prepare_bridge(Self::SERVER_BRIDGE);
+        run_ip(&["link", "set", Self::WAN_BRIDGE, "up"]);
+        run_ip(&["link", "set", Self::SERVER_BRIDGE, "up"]);
+
+        connect_ns_to_bridge(
+            Self::PROVIDER_NS,
+            "pubwan0",
+            "veth_pubwan_p",
+            Self::WAN_BRIDGE,
+        );
+        connect_ns_to_bridge(
+            Self::UPSTREAM_NS,
+            "upwan0",
+            "veth_pubwan_u",
+            Self::WAN_BRIDGE,
+        );
+        connect_ns_to_bridge(
+            Self::UPSTREAM_NS,
+            "upsrv0",
+            "veth_pubsrv_u",
+            Self::SERVER_BRIDGE,
+        );
+        connect_ns_to_bridge(
+            Self::SERVER_NS,
+            "srv0",
+            "veth_pubsrv_s",
+            Self::SERVER_BRIDGE,
+        );
+
+        let (provider_wan_addr, upstream_wan_addr) = match topology {
+            PublicIpv6LabTopology::DelegatedPrefix => {
+                (Self::PROVIDER_WAN_ADDR, Self::UPSTREAM_WAN_ADDR)
+            }
+            PublicIpv6LabTopology::OnLinkPrefix => (
+                Self::ON_LINK_PROVIDER_WAN_ADDR,
+                Self::ON_LINK_UPSTREAM_WAN_ADDR,
+            ),
+        };
+
+        run_ip_in_ns(
+            Self::PROVIDER_NS,
+            &["addr", "add", provider_wan_addr, "dev", "pubwan0"],
+        );
+        run_ip_in_ns(
+            Self::UPSTREAM_NS,
+            &["addr", "add", upstream_wan_addr, "dev", "upwan0"],
+        );
+        run_ip_in_ns(
+            Self::UPSTREAM_NS,
+            &["addr", "add", Self::UPSTREAM_SERVER_ADDR, "dev", "upsrv0"],
+        );
+        run_ip_in_ns(
+            Self::SERVER_NS,
+            &["addr", "add", Self::SERVER_ADDR, "dev", "srv0"],
+        );
+
+        match topology {
+            PublicIpv6LabTopology::DelegatedPrefix => {
+                run_ip_in_ns(
+                    Self::PROVIDER_NS,
+                    &["link", "add", "pubprefix0", "type", "dummy"],
+                );
+                run_ip_in_ns(Self::PROVIDER_NS, &["link", "set", "pubprefix0", "up"]);
+                run_ip_in_ns(
+                    Self::PROVIDER_NS,
+                    &[
+                        "-6",
+                        "route",
+                        "add",
+                        Self::PROVIDER_PREFIX,
+                        "dev",
+                        "pubprefix0",
+                    ],
+                );
+                run_ip_in_ns(
+                    Self::PROVIDER_NS,
+                    &[
+                        "-6",
+                        "route",
+                        "add",
+                        "default",
+                        "from",
+                        Self::PROVIDER_DEFAULT_FROM,
+                        "via",
+                        "2001:db8:ffff:1::1",
+                        "dev",
+                        "pubwan0",
+                    ],
+                );
+            }
+            PublicIpv6LabTopology::OnLinkPrefix => {
+                run_ip_in_ns(
+                    Self::PROVIDER_NS,
+                    &[
+                        "-6",
+                        "route",
+                        "add",
+                        "default",
+                        "via",
+                        "2001:db8:100::1",
+                        "dev",
+                        "pubwan0",
+                    ],
+                );
+            }
+        }
+
+        run_ip_in_ns(
+            Self::SERVER_NS,
+            &[
+                "-6",
+                "route",
+                "add",
+                "default",
+                "via",
+                "2001:db8:ffff:2::1",
+                "dev",
+                "srv0",
+            ],
+        );
+        if matches!(topology, PublicIpv6LabTopology::DelegatedPrefix) {
+            run_ip_in_ns(
+                Self::UPSTREAM_NS,
+                &[
+                    "-6",
+                    "route",
+                    "add",
+                    Self::PROVIDER_PREFIX,
+                    "via",
+                    "2001:db8:ffff:1::2",
+                    "dev",
+                    "upwan0",
+                ],
+            );
+        }
+
+        run_sysctl_in_ns(Self::PROVIDER_NS, "net.ipv6.conf.all.forwarding=1");
+        run_sysctl_in_ns(Self::UPSTREAM_NS, "net.ipv6.conf.all.forwarding=1");
+
+        Self {
+            extra_namespaces: [Self::UPSTREAM_NS, Self::SERVER_NS],
+            extra_bridges: [Self::WAN_BRIDGE, Self::SERVER_BRIDGE],
+        }
+    }
+}
+
+impl Drop for PublicIpv6Lab {
+    fn drop(&mut self) {
+        for ns in self.extra_namespaces {
+            del_netns(ns);
+        }
+        for bridge in self.extra_bridges {
+            let _ = std::process::Command::new("ip")
+                .args(["link", "del", bridge])
+                .status();
+            let _ = std::process::Command::new("brctl")
+                .args(["delbr", bridge])
+                .status();
+        }
+    }
+}
+
+fn get_public_ipv6_config(
+    inst_name: &str,
+    netns: &str,
+    ipv4: &str,
+    dev_name: &str,
+    inst_id: uuid::Uuid,
+) -> TomlConfigLoader {
+    let config = get_inst_config(inst_name, Some(netns), ipv4, "fd00::1/64");
+    config.set_id(inst_id);
+    config.set_ipv6(None);
+    config.set_socks5_portal(None);
+    config.set_network_identity(NetworkIdentity {
+        network_name: "public_ipv6_auto_addr_test".to_string(),
+        network_secret: Some("public_ipv6_auto_addr_secret".to_string()),
+        network_secret_digest: None,
+    });
+    config.set_listeners(vec!["tcp://0.0.0.0:11010".parse().unwrap()]);
+    let mut flags = config.get_flags();
+    flags.dev_name = dev_name.to_string();
+    config.set_flags(flags);
+    config
+}
+
+async fn init_public_ipv6_two_node(
+    client_inst_id: uuid::Uuid,
+) -> (PublicIpv6Lab, Arc<CoreProcessRuntime>, Instance, Instance) {
+    init_public_ipv6_two_node_with_topology(client_inst_id, PublicIpv6LabTopology::DelegatedPrefix)
+        .await
+}
+
+async fn init_public_ipv6_two_node_with_topology(
+    client_inst_id: uuid::Uuid,
+    topology: PublicIpv6LabTopology,
+) -> (PublicIpv6Lab, Arc<CoreProcessRuntime>, Instance, Instance) {
+    let lab = PublicIpv6Lab::setup_with_topology(topology);
+    let process_runtime = CoreProcessRuntime::new();
+
+    let provider_cfg = get_public_ipv6_config(
+        "provider_public_ipv6",
+        PublicIpv6Lab::PROVIDER_NS,
+        "10.144.144.1",
+        PublicIpv6Lab::PROVIDER_TUN,
+        uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+    );
+    provider_cfg.set_ipv6_public_addr_provider(true);
+
+    let client_cfg = get_public_ipv6_config(
+        "client_public_ipv6",
+        PublicIpv6Lab::CLIENT_NS,
+        "10.144.144.2",
+        PublicIpv6Lab::CLIENT_TUN,
+        client_inst_id,
+    );
+    client_cfg.set_ipv6_public_addr_auto(true);
+
+    let mut provider = Instance::new_with_process_runtime(provider_cfg, process_runtime.clone());
+    let mut client = Instance::new_with_process_runtime(client_cfg, process_runtime.clone());
+
+    provider.run().await.unwrap();
+    client.run().await.unwrap();
+
+    provider.add_connector_url("tcp://10.1.1.2:11010".parse().unwrap());
+
+    wait_for_condition(
+        || async {
+            provider.get_core_instance().route_snapshots().await.len() == 1
+                && client.get_core_instance().route_snapshots().await.len() == 1
+        },
+        Duration::from_secs(8),
+    )
+    .await;
+
+    (lab, process_runtime, provider, client)
+}
+
+async fn wait_for_public_ipv6_addr(inst: &Instance) -> cidr::Ipv6Inet {
+    wait_for_condition(
+        || async {
+            inst.get_core_instance()
+                .packet_plane()
+                .public_ipv6_addr()
+                .await
+                .is_some()
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+    inst.get_core_instance()
+        .packet_plane()
+        .public_ipv6_addr()
+        .await
+        .unwrap()
+}
+
+async fn wait_for_public_ipv6_route(inst: &Instance, target: cidr::Ipv6Inet) {
+    wait_for_condition(
+        || async {
+            inst.get_core_instance()
+                .packet_plane()
+                .public_ipv6_routes()
+                .await
+                .contains(&target)
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+}
+
+fn route_exists_in_ns(ns: &str, needle: &str) -> bool {
+    run_ip_in_ns_output(ns, &["-6", "route", "show"])
+        .lines()
+        .any(|line| line.contains(needle))
+}
+
+fn addr_exists_in_ns(ns: &str, dev: &str, needle: &str) -> bool {
+    run_ip_in_ns_output(ns, &["-6", "addr", "show", "dev", dev]).contains(needle)
+}
+
+fn ndp_proxy_exists_in_ns(ns: &str, dev: &str, addr: std::net::Ipv6Addr) -> bool {
+    let addr = addr.to_string();
+    run_ip_in_ns_output(ns, &["-6", "neigh", "show", "proxy", "dev", dev])
+        .lines()
+        .any(|line| line.split_whitespace().next() == Some(addr.as_str()))
+}
+
+#[tokio::test]
+#[serial_test::serial]
+pub async fn public_ipv6_auto_addr_end_to_end() {
+    let client_id = uuid::Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+    let (_lab, _process_runtime, provider, client) = init_public_ipv6_two_node(client_id).await;
+
+    wait_for_condition(
+        || async {
+            provider
+                .get_core_instance()
+                .node_snapshot()
+                .await
+                .ipv6_public_addr_prefix
+                == Some(PublicIpv6Lab::PROVIDER_PREFIX.parse().unwrap())
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    let leased = wait_for_public_ipv6_addr(&client).await;
+    wait_for_public_ipv6_route(&provider, leased).await;
+
+    assert_eq!(
+        provider
+            .get_global_ctx()
+            .config
+            .get_ipv6_public_addr_prefix(),
+        None
+    );
+    assert_eq!(
+        provider
+            .get_core_instance()
+            .node_snapshot()
+            .await
+            .ipv6_public_addr_prefix,
+        Some(PublicIpv6Lab::PROVIDER_PREFIX.parse().unwrap())
+    );
+    let provider_prefix = PublicIpv6Lab::PROVIDER_PREFIX
+        .parse::<cidr::Ipv6Cidr>()
+        .unwrap();
+    assert_eq!(
+        provider
+            .get_core_instance()
+            .node_snapshot()
+            .await
+            .ipv6_public_addr_prefix,
+        Some(
+            cidr::Ipv6Inet::new(
+                provider_prefix.first_address(),
+                provider_prefix.network_length()
+            )
+            .unwrap()
+        )
+    );
+    let provider_info = provider.get_core_instance().local_public_ipv6_info().await;
+    let client_peer_id = client.get_core_instance().node_snapshot().await.peer_id;
+    assert_eq!(
+        provider_info.provider_prefix,
+        Some(
+            cidr::Ipv6Inet::new(
+                provider_prefix.first_address(),
+                provider_prefix.network_length()
+            )
+            .unwrap()
+            .into()
+        )
+    );
+    assert_eq!(provider_info.provider_leases.len(), 1);
+    assert_eq!(provider_info.provider_leases[0].peer_id, client_peer_id);
+    assert_eq!(
+        provider_info.provider_leases[0].inst_id,
+        client_id.to_string()
+    );
+    assert_eq!(
+        provider_info.provider_leases[0].leased_addr,
+        Some(leased.into())
+    );
+    assert!(
+        leased.address().segments()[0] & 0xfe00 != 0xfc00,
+        "leased address should not be unique-local: {leased}"
+    );
+
+    wait_for_condition(
+        || async {
+            addr_exists_in_ns(
+                PublicIpv6Lab::CLIENT_NS,
+                PublicIpv6Lab::CLIENT_TUN,
+                &leased.to_string(),
+            ) && route_exists_in_ns(
+                PublicIpv6Lab::CLIENT_NS,
+                &format!("default dev {}", PublicIpv6Lab::CLIENT_TUN),
+            ) && route_exists_in_ns(
+                PublicIpv6Lab::PROVIDER_NS,
+                &format!("{} dev {}", leased.address(), PublicIpv6Lab::PROVIDER_TUN),
+            )
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    wait_for_condition(
+        || async { ping6_test(PublicIpv6Lab::CLIENT_NS, PublicIpv6Lab::SERVER_IP, None).await },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    wait_for_condition(
+        || async {
+            ping6_test(
+                PublicIpv6Lab::SERVER_NS,
+                leased.address().to_string().as_str(),
+                None,
+            )
+            .await
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    drop_insts(vec![provider, client]).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+pub async fn public_ipv6_auto_addr_on_link_ndp_proxy_end_to_end() {
+    let client_id = uuid::Uuid::parse_str("44444444-4444-4444-4444-444444444444").unwrap();
+    let (_lab, _process_runtime, provider, client) =
+        init_public_ipv6_two_node_with_topology(client_id, PublicIpv6LabTopology::OnLinkPrefix)
+            .await;
+
+    wait_for_condition(
+        || async {
+            provider
+                .get_core_instance()
+                .node_snapshot()
+                .await
+                .ipv6_public_addr_prefix
+                == Some(PublicIpv6Lab::PROVIDER_PREFIX.parse().unwrap())
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    let leased = wait_for_public_ipv6_addr(&client).await;
+    wait_for_public_ipv6_route(&provider, leased).await;
+
+    wait_for_condition(
+        || async {
+            addr_exists_in_ns(
+                PublicIpv6Lab::CLIENT_NS,
+                PublicIpv6Lab::CLIENT_TUN,
+                &leased.to_string(),
+            ) && route_exists_in_ns(
+                PublicIpv6Lab::PROVIDER_NS,
+                &format!("{} dev {}", leased.address(), PublicIpv6Lab::PROVIDER_TUN),
+            )
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    wait_for_condition(
+        || async {
+            ndp_proxy_exists_in_ns(PublicIpv6Lab::PROVIDER_NS, "pubwan0", leased.address())
+        },
+        Duration::from_secs(20),
+    )
+    .await;
+
+    wait_for_condition(
+        || async {
+            ping6_test(
+                PublicIpv6Lab::SERVER_NS,
+                leased.address().to_string().as_str(),
+                None,
+            )
+            .await
+        },
+        Duration::from_secs(20),
+    )
+    .await;
+
+    drop_insts(vec![provider, client]).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+pub async fn public_ipv6_auto_addr_reconnect_reuses_same_address() {
+    let client_id = uuid::Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
+    let (_lab, process_runtime, provider, client) = init_public_ipv6_two_node(client_id).await;
+    let first = wait_for_public_ipv6_addr(&client).await;
+
+    drop_insts(vec![client]).await;
+
+    let client_cfg = get_public_ipv6_config(
+        "client_public_ipv6_reconnect",
+        PublicIpv6Lab::CLIENT_NS,
+        "10.144.144.2",
+        PublicIpv6Lab::CLIENT_TUN,
+        client_id,
+    );
+    client_cfg.set_ipv6_public_addr_auto(true);
+    let mut client = Instance::new_with_process_runtime(client_cfg, process_runtime.clone());
+    client.run().await.unwrap();
+    provider.add_connector_url("tcp://10.1.1.2:11010".parse().unwrap());
+
+    wait_for_condition(
+        || async {
+            provider.get_core_instance().route_snapshots().await.len() == 1
+                && client.get_core_instance().route_snapshots().await.len() == 1
+        },
+        Duration::from_secs(8),
+    )
+    .await;
+
+    let second = wait_for_public_ipv6_addr(&client).await;
+    assert_eq!(first, second);
+
+    wait_for_condition(
+        || async { ping6_test(PublicIpv6Lab::CLIENT_NS, PublicIpv6Lab::SERVER_IP, None).await },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    drop_insts(vec![provider, client]).await;
+}
+
 #[rstest::rstest]
 #[tokio::test]
 #[serial_test::serial]
@@ -312,13 +1058,13 @@ pub async fn basic_three_node_test(
     check_route(
         "10.144.144.2/24",
         insts[1].peer_id(),
-        insts[0].get_peer_manager().list_routes().await,
+        insts[0].get_core_instance().route_snapshots().await,
     );
 
     check_route(
         "10.144.144.3/24",
         insts[2].peer_id(),
-        insts[0].get_peer_manager().list_routes().await,
+        insts[0].get_core_instance().route_snapshots().await,
     );
 
     // Test IPv4 connectivity
@@ -337,6 +1083,26 @@ pub async fn basic_three_node_test(
 
     wait_for_condition(
         || async { ping6_test("net_a", "fd00::3", None).await },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    drop_insts(insts).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+pub async fn ping_own_virtual_ip_should_work() {
+    let insts = init_three_node("udp").await;
+
+    wait_for_condition(
+        || async { ping_test("net_a", "10.144.144.1", None).await },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    wait_for_condition(
+        || async { ping6_test("net_a", "fd00::1", None).await },
         Duration::from_secs(5),
     )
     .await;
@@ -369,7 +1135,7 @@ pub async fn subnet_proxy_loop_prevention_test() {
 
     // 等待代理路由出现 - inst1 应该看到 inst2 的代理路由
     wait_proxy_route_appear(
-        &insts[0].get_peer_manager(),
+        &insts[0].get_core_instance(),
         "10.144.144.2/24",
         insts[1].peer_id(),
         "10.1.2.0/24",
@@ -378,7 +1144,7 @@ pub async fn subnet_proxy_loop_prevention_test() {
 
     // 等待代理路由出现 - inst2 应该看到 inst1 的代理路由
     wait_proxy_route_appear(
-        &insts[1].get_peer_manager(),
+        &insts[1].get_core_instance(),
         "10.144.144.1/24",
         insts[0].peer_id(),
         "10.1.2.0/24",
@@ -395,34 +1161,25 @@ pub async fn subnet_proxy_loop_prevention_test() {
 
     println!(
         "inst0 metrics: {:?}",
-        insts[0]
-            .get_global_ctx()
-            .stats_manager()
-            .export_prometheus()
+        insts[0].get_core_instance().prometheus_metrics()
     );
 
-    let all_metrics = insts[0].get_global_ctx().stats_manager().get_all_metrics();
+    let all_metrics = insts[0].get_core_instance().metric_snapshots();
     for metric in all_metrics {
         if metric.name == MetricName::TrafficPacketsSelfTx {
-            let counter = insts[0]
-                .get_global_ctx()
-                .stats_manager()
-                .get_counter(metric.name, metric.labels.clone());
-            assert!(counter.get() < 40);
+            assert!(metric.value < 40);
         }
     }
 
     drop_insts(insts).await;
 }
 
-async fn subnet_proxy_test_udp(listen_ip: &str, target_ip: &str) {
-    use crate::tunnel::{common::tests::_tunnel_pingpong_netns, udp::UdpTunnelListener};
+async fn subnet_proxy_test_udp(listen_ip: &str, target_ip: &str, timeout: Duration) {
+    use crate::tunnel::common::tests::_tunnel_pingpong_netns_with_timeout;
     use rand::Rng;
 
-    let udp_listener =
-        UdpTunnelListener::new(format!("udp://{}:22233", listen_ip).parse().unwrap());
-    let udp_connector =
-        UdpTunnelConnector::new(format!("udp://{}:22233", target_ip).parse().unwrap());
+    let udp_listener = core_udp_listener(format!("udp://{}:22233", listen_ip).parse().unwrap());
+    let udp_connector = core_udp_dialer(format!("udp://{}:22233", target_ip).parse().unwrap());
 
     // NOTE: this should not excced udp tunnel max buffer size
     let mut buf = vec![0; 7 * 1024];
@@ -434,41 +1191,42 @@ async fn subnet_proxy_test_udp(listen_ip: &str, target_ip: &str) {
         "net_d"
     };
 
-    _tunnel_pingpong_netns(
+    let result = _tunnel_pingpong_netns_with_timeout(
         udp_listener,
         udp_connector,
         NetNS::new(Some(ns_name.into())),
         NetNS::new(Some("net_a".into())),
         buf,
+        timeout,
     )
     .await;
+    assert!(result.is_ok(), "{}", result.unwrap_err());
 
     // no fragment
-    let udp_listener =
-        UdpTunnelListener::new(format!("udp://{}:22233", listen_ip).parse().unwrap());
-    let udp_connector =
-        UdpTunnelConnector::new(format!("udp://{}:22233", target_ip).parse().unwrap());
+    let udp_listener = core_udp_listener(format!("udp://{}:22233", listen_ip).parse().unwrap());
+    let udp_connector = core_udp_dialer(format!("udp://{}:22233", target_ip).parse().unwrap());
 
     let mut buf = vec![0; 1024];
     rand::thread_rng().fill(&mut buf[..]);
 
-    _tunnel_pingpong_netns(
+    let result = _tunnel_pingpong_netns_with_timeout(
         udp_listener,
         udp_connector,
         NetNS::new(Some(ns_name.into())),
         NetNS::new(Some("net_a".into())),
         buf,
+        timeout,
     )
     .await;
+    assert!(result.is_ok(), "{}", result.unwrap_err());
 }
 
-async fn subnet_proxy_test_tcp(listen_ip: &str, connect_ip: &str) {
-    use crate::tunnel::{common::tests::_tunnel_pingpong_netns, tcp::TcpTunnelListener};
+async fn subnet_proxy_test_tcp(listen_ip: &str, connect_ip: &str, timeout: Duration) {
+    use crate::tunnel::common::tests::_tunnel_pingpong_netns_with_timeout;
     use rand::Rng;
 
-    let tcp_listener = TcpTunnelListener::new(format!("tcp://{listen_ip}:22223").parse().unwrap());
-    let tcp_connector =
-        TcpTunnelConnector::new(format!("tcp://{}:22223", connect_ip).parse().unwrap());
+    let tcp_listener = core_tcp_listener(format!("tcp://{listen_ip}:22223").parse().unwrap());
+    let tcp_connector = core_tcp_dialer(format!("tcp://{}:22223", connect_ip).parse().unwrap());
 
     let mut buf = vec![0; 32];
     rand::thread_rng().fill(&mut buf[..]);
@@ -479,26 +1237,28 @@ async fn subnet_proxy_test_tcp(listen_ip: &str, connect_ip: &str) {
         "net_d"
     };
 
-    _tunnel_pingpong_netns(
+    let result = _tunnel_pingpong_netns_with_timeout(
         tcp_listener,
         tcp_connector,
         NetNS::new(Some(ns_name.into())),
         NetNS::new(Some("net_a".into())),
         buf,
+        timeout,
     )
     .await;
+    assert!(result.is_ok(), "{}", result.unwrap_err());
 }
 
-async fn subnet_proxy_test_icmp(target_ip: &str) {
+async fn subnet_proxy_test_icmp(target_ip: &str, timeout: Duration) {
     wait_for_condition(
         || async { ping_test("net_a", target_ip, None).await },
-        Duration::from_secs(5),
+        timeout,
     )
     .await;
 
     wait_for_condition(
         || async { ping_test("net_a", target_ip, Some(5 * 1024)).await },
-        Duration::from_secs(5),
+        timeout,
     )
     .await;
 }
@@ -525,7 +1285,7 @@ pub async fn quic_proxy() {
     assert_eq!(insts[2].get_global_ctx().config.get_proxy_cidrs().len(), 1);
 
     wait_proxy_route_appear(
-        &insts[0].get_peer_manager(),
+        &insts[0].get_core_instance(),
         "10.144.144.3/24",
         insts[2].peer_id(),
         "10.1.2.0/24",
@@ -534,15 +1294,17 @@ pub async fn quic_proxy() {
 
     let target_ip = "10.1.2.4";
 
-    subnet_proxy_test_icmp(target_ip).await;
-    subnet_proxy_test_icmp("10.144.144.3").await;
-    subnet_proxy_test_tcp(target_ip, target_ip).await;
-    subnet_proxy_test_tcp("0.0.0.0", "10.144.144.3").await;
+    subnet_proxy_test_icmp(target_ip, Duration::from_secs(5)).await;
+    subnet_proxy_test_icmp("10.144.144.3", Duration::from_secs(5)).await;
+    subnet_proxy_test_tcp(target_ip, target_ip, Duration::from_secs(5)).await;
+    subnet_proxy_test_tcp("0.0.0.0", "10.144.144.3", Duration::from_secs(5)).await;
 
     let metrics = insts[0]
-        .get_global_ctx()
-        .stats_manager()
-        .get_metrics_by_prefix(&MetricName::TcpProxyConnect.to_string());
+        .get_core_instance()
+        .metric_snapshots()
+        .into_iter()
+        .filter(|metric| metric.name == MetricName::TcpProxyConnect)
+        .collect::<Vec<_>>();
     assert_eq!(metrics.len(), 2);
     assert_eq!(1, metrics[0].value);
     assert_eq!(1, metrics[1].value);
@@ -610,14 +1372,14 @@ pub async fn subnet_proxy_three_node_test(
     assert_eq!(insts[2].get_global_ctx().config.get_proxy_cidrs().len(), 2);
 
     wait_proxy_route_appear(
-        &insts[0].get_peer_manager(),
+        &insts[0].get_core_instance(),
         "10.144.144.3/24",
         insts[2].peer_id(),
         "10.1.2.0/24",
     )
     .await;
     wait_proxy_route_appear(
-        &insts[0].get_peer_manager(),
+        &insts[0].get_core_instance(),
         "10.144.144.3/24",
         insts[2].peer_id(),
         "10.1.3.0/24",
@@ -625,35 +1387,22 @@ pub async fn subnet_proxy_three_node_test(
     .await;
 
     for target_ip in ["10.1.3.4", "10.1.2.4", "10.144.144.3"] {
-        subnet_proxy_test_icmp(target_ip).await;
+        subnet_proxy_test_icmp(target_ip, Duration::from_secs(5)).await;
         let listen_ip = if target_ip == "10.144.144.3" {
             "0.0.0.0"
         } else {
             "10.1.2.4"
         };
-        subnet_proxy_test_tcp(listen_ip, target_ip).await;
-        subnet_proxy_test_udp(listen_ip, target_ip).await;
+        subnet_proxy_test_tcp(listen_ip, target_ip, Duration::from_secs(5)).await;
+        subnet_proxy_test_udp(listen_ip, target_ip, Duration::from_secs(5)).await;
     }
-
-    if enable_kcp_proxy && !disable_kcp_input {
+    if enable_quic_proxy && !disable_quic_input {
         let metrics = insts[0]
-            .get_global_ctx()
-            .stats_manager()
-            .get_metrics_by_prefix(&MetricName::TcpProxyConnect.to_string());
-        assert_eq!(metrics.len(), 3);
-        for metric in metrics {
-            assert_eq!(1, metric.value);
-            assert!(metric.labels.labels().iter().any(|l| {
-                let t =
-                    LabelType::Protocol(TcpProxyEntryTransportType::Kcp.as_str_name().to_string());
-                t.key() == l.key && t.value() == l.value
-            }));
-        }
-    } else if enable_quic_proxy && !disable_quic_input {
-        let metrics = insts[0]
-            .get_global_ctx()
-            .stats_manager()
-            .get_metrics_by_prefix(&MetricName::TcpProxyConnect.to_string());
+            .get_core_instance()
+            .metric_snapshots()
+            .into_iter()
+            .filter(|metric| metric.name == MetricName::TcpProxyConnect)
+            .collect::<Vec<_>>();
         assert_eq!(metrics.len(), 3);
         for metric in metrics {
             assert_eq!(1, metric.value);
@@ -663,12 +1412,30 @@ pub async fn subnet_proxy_three_node_test(
                 t.key() == l.key && t.value() == l.value
             }));
         }
+    } else if enable_kcp_proxy && !disable_kcp_input {
+        let metrics = insts[0]
+            .get_core_instance()
+            .metric_snapshots()
+            .into_iter()
+            .filter(|metric| metric.name == MetricName::TcpProxyConnect)
+            .collect::<Vec<_>>();
+        assert_eq!(metrics.len(), 3);
+        for metric in metrics {
+            assert_eq!(1, metric.value);
+            assert!(metric.labels.labels().iter().any(|l| {
+                let t =
+                    LabelType::Protocol(TcpProxyEntryTransportType::Kcp.as_str_name().to_string());
+                t.key() == l.key && t.value() == l.value
+            }));
+        }
     } else {
         // tcp subnet proxy
         let metrics = insts[2]
-            .get_global_ctx()
-            .stats_manager()
-            .get_metrics_by_prefix(&MetricName::TcpProxyConnect.to_string());
+            .get_core_instance()
+            .metric_snapshots()
+            .into_iter()
+            .filter(|metric| metric.name == MetricName::TcpProxyConnect)
+            .collect::<Vec<_>>();
         if no_tun {
             assert_eq!(metrics.len(), 3);
         } else {
@@ -735,38 +1502,18 @@ pub async fn data_compress(
 #[tokio::test]
 #[serial_test::serial]
 pub async fn proxy_three_node_disconnect_test(#[values("tcp", "wg")] proto: &str) {
-    use crate::{
-        common::scoped_task::ScopedTask,
-        tunnel::wireguard::{WgConfig, WgTunnelConnector},
-    };
+    use tokio_util::task::AbortOnDropHandle;
 
-    let insts = init_three_node(proto).await;
-    let mut inst4 = Instance::new(get_inst_config(
-        "inst4",
-        Some("net_d"),
-        "10.144.144.4",
-        "fd00::4/64",
-    ));
+    let process_runtime = CoreProcessRuntime::new();
+    let insts = init_three_node_with_process_runtime(proto, process_runtime.clone()).await;
+    let mut inst4 = Instance::new_with_process_runtime(
+        get_inst_config("inst4", Some("net_d"), "10.144.144.4", "fd00::4/64"),
+        process_runtime.clone(),
+    );
     if proto == "tcp" {
-        inst4
-            .get_conn_manager()
-            .add_connector(TcpTunnelConnector::new(
-                "tcp://10.1.2.3:11010".parse().unwrap(),
-            ));
+        inst4.add_connector_url("tcp://10.1.2.3:11010".parse().unwrap());
     } else if proto == "wg" {
-        inst4
-            .get_conn_manager()
-            .add_connector(WgTunnelConnector::new(
-                "wg://10.1.2.3:11011".parse().unwrap(),
-                WgConfig::new_from_network_identity(
-                    &inst4.get_global_ctx().get_network_identity().network_name,
-                    &inst4
-                        .get_global_ctx()
-                        .get_network_identity()
-                        .network_secret
-                        .unwrap_or_default(),
-                ),
-            ));
+        inst4.add_connector_url("wg://10.1.2.3:11011".parse().unwrap());
     } else {
         unreachable!("not support");
     }
@@ -783,8 +1530,8 @@ pub async fn proxy_three_node_disconnect_test(#[values("tcp", "wg")] proto: &str
             wait_for_condition(
                 || async {
                     insts[0]
-                        .get_peer_manager()
-                        .list_routes()
+                        .get_core_instance()
+                        .route_snapshots()
                         .await
                         .iter()
                         .any(|r| r.peer_id == inst4.peer_id())
@@ -794,7 +1541,7 @@ pub async fn proxy_three_node_disconnect_test(#[values("tcp", "wg")] proto: &str
             .await;
 
             set_link_status("net_d", false);
-            let _t = ScopedTask::from(tokio::spawn(async move {
+            let _t = AbortOnDropHandle::new(tokio::spawn(async move {
                 // do some ping in net_a to trigger net_c pingpong
                 loop {
                     ping_test("net_a", "10.144.144.4", Some(1)).await;
@@ -802,28 +1549,25 @@ pub async fn proxy_three_node_disconnect_test(#[values("tcp", "wg")] proto: &str
             }));
             wait_for_condition(
                 || async {
-                    let ret = !insts[2]
-                        .get_peer_manager()
-                        .get_peer_map()
-                        .list_peers_with_conn()
+                    !insts[2]
+                        .get_core_instance()
+                        .connected_peers()
                         .await
                         .iter()
-                        .any(|r| *r == inst4.peer_id());
-
-                    ret
+                        .any(|r| *r == inst4.peer_id())
                 },
                 // 0 down, assume last packet is recv in -0.01
-                // [2, 7) send ping
-                // [4, 9) ping fail and close connection
-                Duration::from_secs(11),
+                // one ping outstanding at a time, each waits up to 2s:
+                // 5 consecutive failures close the connection at ~[4, 11)
+                Duration::from_secs(15),
             )
             .await;
 
             wait_for_condition(
                 || async {
                     !insts[0]
-                        .get_peer_manager()
-                        .list_routes()
+                        .get_core_instance()
+                        .route_snapshots()
                         .await
                         .iter()
                         .any(|r| r.peer_id == inst4.peer_id())
@@ -896,48 +1640,38 @@ pub async fn udp_broadcast_test() {
 #[serial_test::serial]
 pub async fn foreign_network_forward_nic_data() {
     prepare_linux_namespaces();
+    let process_runtime = CoreProcessRuntime::new();
 
     let center_node_config = get_inst_config("inst1", Some("net_a"), "10.144.144.1", "fd00::1/64");
     center_node_config
         .set_network_identity(NetworkIdentity::new("center".to_string(), "".to_string()));
-    let mut center_inst = Instance::new(center_node_config);
+    let mut center_inst =
+        Instance::new_with_process_runtime(center_node_config, process_runtime.clone());
 
-    let mut inst1 = Instance::new(get_inst_config(
-        "inst1",
-        Some("net_b"),
-        "10.144.145.1",
-        "fd00:1::1/64",
-    ));
-    let mut inst2 = Instance::new(get_inst_config(
-        "inst2",
-        Some("net_c"),
-        "10.144.145.2",
-        "fd00:1::2/64",
-    ));
+    let mut inst1 = Instance::new_with_process_runtime(
+        get_inst_config("inst1", Some("net_b"), "10.144.145.1", "fd00:1::1/64"),
+        process_runtime.clone(),
+    );
+    let mut inst2 = Instance::new_with_process_runtime(
+        get_inst_config("inst2", Some("net_c"), "10.144.145.2", "fd00:1::2/64"),
+        process_runtime,
+    );
 
     center_inst.run().await.unwrap();
     inst1.run().await.unwrap();
     inst2.run().await.unwrap();
 
-    assert_ne!(inst1.id(), center_inst.id());
-    assert_ne!(inst2.id(), center_inst.id());
+    assert_ne!(inst1.ring_listener_url(), center_inst.ring_listener_url());
+    assert_ne!(inst2.ring_listener_url(), center_inst.ring_listener_url());
 
-    inst1
-        .get_conn_manager()
-        .add_connector(RingTunnelConnector::new(
-            format!("ring://{}", center_inst.id()).parse().unwrap(),
-        ));
+    inst1.add_connector_url(center_inst.ring_listener_url());
 
-    inst2
-        .get_conn_manager()
-        .add_connector(RingTunnelConnector::new(
-            format!("ring://{}", center_inst.id()).parse().unwrap(),
-        ));
+    inst2.add_connector_url(center_inst.ring_listener_url());
 
     wait_for_condition(
         || async {
-            inst1.get_peer_manager().list_routes().await.len() == 2
-                && inst2.get_peer_manager().list_routes().await.len() == 2
+            inst1.get_core_instance().route_snapshots().await.len() == 2
+                && inst2.get_core_instance().route_snapshots().await.len() == 2
         },
         Duration::from_secs(5),
     )
@@ -955,10 +1689,20 @@ pub async fn foreign_network_forward_nic_data() {
 use std::{net::SocketAddr, str::FromStr};
 
 use defguard_wireguard_rs::{
-    host::Peer, key::Key, net::IpAddrMask, InterfaceConfiguration, WGApi, WireguardInterfaceApi,
+    InterfaceConfiguration, WGApi, WireguardInterfaceApi, host::Peer, key::Key, net::IpAddrMask,
 };
 
+fn wireguard_ifname(base: &str) -> String {
+    if cfg!(target_os = "linux") || cfg!(target_os = "freebsd") {
+        base.to_owned()
+    } else {
+        "utun3".into()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_wireguard_client(
+    ifname: &str,
     endpoint: SocketAddr,
     peer_public_key: Key,
     client_private_key: Key,
@@ -966,12 +1710,7 @@ fn run_wireguard_client(
     client_ip: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Create new API object for interface
-    let ifname: String = if cfg!(target_os = "linux") || cfg!(target_os = "freebsd") {
-        "wg0".into()
-    } else {
-        "utun3".into()
-    };
-    let wgapi = WGApi::new(ifname.clone(), false)?;
+    let wgapi = WGApi::new(ifname.to_owned(), false)?;
 
     // create interface
     wgapi.create_interface()?;
@@ -989,7 +1728,7 @@ fn run_wireguard_client(
 
     // interface configuration
     let interface_config = InterfaceConfiguration {
-        name: ifname.clone(),
+        name: ifname.to_owned(),
         prvkey: client_private_key.to_string(),
         address: client_ip,
         port: 12345,
@@ -1009,24 +1748,41 @@ fn run_wireguard_client(
 #[tokio::test]
 #[serial_test::serial]
 pub async fn wireguard_vpn_portal(#[values(true, false)] test_v6: bool) {
-    let mut insts = init_three_node("tcp").await;
+    let insts = init_three_node_ex(
+        "tcp",
+        |config| {
+            let identity = config.get_network_identity();
+            config.set_network_identity(NetworkIdentity::new(
+                identity.network_name,
+                "wireguard-portal-test".to_owned(),
+            ));
+            if config.get_inst_name() == "inst1" {
+                config
+                    .add_proxy_cidr("198.51.100.0/24".parse().unwrap(), None)
+                    .unwrap();
+            }
+            if config.get_inst_name() == "inst3" {
+                config.set_vpn_portal_config(VpnPortalConfig {
+                    wireguard_listen: "0.0.0.0:22121".parse().unwrap(),
+                    wireguard_private_key: Some(BASE64_STANDARD.encode([42u8; 32])),
+                    clients: vec![VpnPortalClientConfig {
+                        name: "test-client".to_owned(),
+                        virtual_ip: "10.144.144.4/24".parse().unwrap(),
+                        groups: Vec::new(),
+                    }],
+                });
+            }
+            config
+        },
+        false,
+    )
+    .await;
 
     if test_v6 {
         ping6_test("net_d", "fd12::3", None).await;
     } else {
         ping_test("net_d", "10.1.2.3", None).await;
     }
-
-    let net_ns = NetNS::new(Some("net_d".into()));
-    let _g = net_ns.guard();
-    insts[2]
-        .get_global_ctx()
-        .config
-        .set_vpn_portal_config(VpnPortalConfig {
-            wireguard_listen: "0.0.0.0:22121".parse().unwrap(),
-            client_cidr: "10.14.14.0/24".parse().unwrap(),
-        });
-    insts[2].run_vpn_portal().await.unwrap();
 
     let dst_socket_addr = if test_v6 {
         "[fd12::3]:22121".parse().unwrap()
@@ -1036,13 +1792,37 @@ pub async fn wireguard_vpn_portal(#[values(true, false)] test_v6: bool) {
 
     let net_ns = NetNS::new(Some("net_d".into()));
     let _g = net_ns.guard();
-    let wg_cfg = get_wg_config_for_portal(&insts[2].get_global_ctx().get_network_identity());
+    let portal_config = insts[2]
+        .get_global_ctx()
+        .config
+        .get_vpn_portal_config()
+        .unwrap();
+    let portal_info = insts[2].get_core_instance().vpn_portal_info().await;
+    assert_eq!(portal_info.clients.len(), 1);
+    let client_info = portal_info
+        .clients
+        .iter()
+        .find(|client| client.name == "test-client")
+        .expect("configured client must be reported");
+    assert!(
+        client_info.client_config.contains("198.51.100.0/24"),
+        "client config must include remote proxy CIDRs"
+    );
+    assert!(
+        client_info
+            .client_config
+            .contains("Address = 10.144.144.4/32"),
+        "client config must assign the attached peer virtual IP"
+    );
+    let (server_public, client_private) =
+        test_wireguard_keys(&portal_config, "test-client").unwrap();
     run_wireguard_client(
+        &wireguard_ifname("wg0"),
         dst_socket_addr,
-        Key::try_from(wg_cfg.my_public_key()).unwrap(),
-        Key::try_from(wg_cfg.peer_secret_key()).unwrap(),
-        vec!["10.14.14.0/24".to_string(), "10.144.144.0/24".to_string()],
-        "10.14.14.2".to_string(),
+        Key::try_from(server_public.as_slice()).unwrap(),
+        Key::try_from(client_private.as_slice()).unwrap(),
+        vec!["10.144.144.0/24".to_string()],
+        "10.144.144.4".to_owned(),
     )
     .unwrap();
 
@@ -1065,6 +1845,498 @@ pub async fn wireguard_vpn_portal(#[values(true, false)] test_v6: bool) {
     )
     .await;
 
+    drop_insts(insts).await;
+}
+
+#[cfg(feature = "wireguard")]
+#[tokio::test]
+#[serial_test::serial]
+pub async fn wireguard_vpn_portal_multi_client() {
+    use rand::Rng as _;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
+
+    let insts = init_three_node_ex(
+        "tcp",
+        |config| {
+            let identity = config.get_network_identity();
+            config.set_network_identity(NetworkIdentity::new(
+                identity.network_name,
+                "wireguard-portal-multi-client-test".to_owned(),
+            ));
+            if config.get_inst_name() == "inst3" {
+                config.set_vpn_portal_config(VpnPortalConfig {
+                    wireguard_listen: "0.0.0.0:22121".parse().unwrap(),
+                    wireguard_private_key: Some(BASE64_STANDARD.encode([42u8; 32])),
+                    clients: vec![
+                        VpnPortalClientConfig {
+                            name: "client-a".to_owned(),
+                            virtual_ip: "10.144.144.4/24".parse().unwrap(),
+                            groups: Vec::new(),
+                        },
+                        VpnPortalClientConfig {
+                            name: "client-b".to_owned(),
+                            virtual_ip: "10.144.144.5/24".parse().unwrap(),
+                            groups: Vec::new(),
+                        },
+                    ],
+                });
+            }
+            config
+        },
+        false,
+    )
+    .await;
+
+    let portal_config = insts[2]
+        .get_global_ctx()
+        .config
+        .get_vpn_portal_config()
+        .unwrap();
+
+    for (ns, client_name, virtual_ip) in [
+        ("net_d", "client-a", "10.144.144.4"),
+        ("net_f", "client-b", "10.144.144.5"),
+    ] {
+        let net_ns = NetNS::new(Some(ns.into()));
+        let _g = net_ns.guard();
+        let (server_public, client_private) =
+            test_wireguard_keys(&portal_config, client_name).unwrap();
+        run_wireguard_client(
+            &wireguard_ifname("wg0"),
+            "10.1.2.3:22121".parse().unwrap(),
+            Key::try_from(server_public.as_slice()).unwrap(),
+            Key::try_from(client_private.as_slice()).unwrap(),
+            vec!["10.144.144.0/24".to_string()],
+            virtual_ip.to_owned(),
+        )
+        .unwrap();
+    }
+
+    // 两个客户端各自 ping mesh 内节点
+    for ns in ["net_d", "net_f"] {
+        wait_for_condition(
+            || async { ping_test(ns, "10.144.144.1", None).await },
+            Duration::from_secs(10),
+        )
+        .await;
+        wait_for_condition(
+            || async { ping_test(ns, "10.144.144.2", None).await },
+            Duration::from_secs(10),
+        )
+        .await;
+    }
+
+    // 跨客户端互 ping 对方的虚拟 IP，验证 WireGuard 地址与 attached
+    // peer 地址相同且双向数据包无需地址改写。
+    wait_for_condition(
+        || async { ping_test("net_d", "10.144.144.5", None).await },
+        Duration::from_secs(10),
+    )
+    .await;
+    wait_for_condition(
+        || async { ping_test("net_f", "10.144.144.4", None).await },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    // TCP 数据面：node1 侧看到的连接源地址必须是 client-a 的虚拟 IP，
+    // 并做一段随机数据回环，验证传输层校验和保持不变。
+    let mut buf = vec![0u8; 1024];
+    rand::thread_rng().fill(&mut buf[..]);
+    let expected = buf.clone();
+    let echo_task = tokio::spawn(async move {
+        let net_ns = NetNS::new(Some("net_a".into()));
+        let _g = net_ns.guard();
+        let socket = TcpListener::bind("0.0.0.0:22222").await.unwrap();
+        let (mut st, addr) = socket.accept().await.unwrap();
+        assert_eq!(addr.ip().to_string(), "10.144.144.4".to_string());
+        let mut rbuf = vec![0u8; 1024];
+        st.read_exact(&mut rbuf).await.unwrap();
+        assert_eq!(rbuf, expected);
+        st.write_all(&rbuf).await.unwrap();
+    });
+    {
+        let net_ns = NetNS::new(Some("net_d".into()));
+        let _g = net_ns.guard();
+        let mut stream = TcpStream::connect("10.144.144.1:22222").await.unwrap();
+        stream.write_all(&buf).await.unwrap();
+        let mut rbuf = vec![0u8; 1024];
+        stream.read_exact(&mut rbuf).await.unwrap();
+        assert_eq!(rbuf, buf);
+    }
+    echo_task.await.unwrap();
+
+    // portal 状态：两个客户端均在线，隧道地址等于各自的 attached peer
+    // 虚拟 IP，peer_id 互不相同。
+    let portal_info = insts[2].get_core_instance().vpn_portal_info().await;
+    assert_eq!(portal_info.clients.len(), 2);
+    let client_a = portal_info
+        .clients
+        .iter()
+        .find(|client| client.name == "client-a")
+        .expect("client-a must be reported");
+    let client_b = portal_info
+        .clients
+        .iter()
+        .find(|client| client.name == "client-b")
+        .expect("client-b must be reported");
+    for client in [client_a, client_b] {
+        assert_eq!(client.state, PortalClientState::Online);
+        assert!(client.peer_id.is_some());
+    }
+    assert_ne!(client_a.peer_id, client_b.peer_id);
+    assert_eq!(client_a.tunnel_ip, Some("10.144.144.4".parse().unwrap()));
+    assert_eq!(client_b.tunnel_ip, Some("10.144.144.5".parse().unwrap()));
+
+    drop_insts(insts).await;
+}
+
+#[cfg(feature = "wireguard")]
+#[tokio::test]
+#[serial_test::serial]
+pub async fn wireguard_vpn_portal_client_roaming() {
+    let insts = init_three_node_ex(
+        "tcp",
+        |config| {
+            let identity = config.get_network_identity();
+            config.set_network_identity(NetworkIdentity::new(
+                identity.network_name,
+                "wireguard-portal-roaming-test".to_owned(),
+            ));
+            if config.get_inst_name() == "inst3" {
+                config.set_vpn_portal_config(VpnPortalConfig {
+                    wireguard_listen: "0.0.0.0:22121".parse().unwrap(),
+                    wireguard_private_key: Some(BASE64_STANDARD.encode([42u8; 32])),
+                    clients: vec![VpnPortalClientConfig {
+                        name: "roaming-client".to_owned(),
+                        virtual_ip: "10.144.144.4/24".parse().unwrap(),
+                        groups: Vec::new(),
+                    }],
+                });
+            }
+            config
+        },
+        false,
+    )
+    .await;
+
+    let portal_config = insts[2]
+        .get_global_ctx()
+        .config
+        .get_vpn_portal_config()
+        .unwrap();
+    {
+        let net_ns = NetNS::new(Some("net_d".into()));
+        let _g = net_ns.guard();
+        let (server_public, client_private) =
+            test_wireguard_keys(&portal_config, "roaming-client").unwrap();
+        run_wireguard_client(
+            &wireguard_ifname("wg0"),
+            "10.1.2.3:22121".parse().unwrap(),
+            Key::try_from(server_public.as_slice()).unwrap(),
+            Key::try_from(client_private.as_slice()).unwrap(),
+            vec!["10.144.144.0/24".to_string()],
+            "10.144.144.4".to_owned(),
+        )
+        .unwrap();
+    }
+
+    // 客户端在 net_d（源地址 10.1.2.4）上线
+    wait_for_condition(
+        || async { ping_test("net_d", "10.144.144.1", None).await },
+        Duration::from_secs(10),
+    )
+    .await;
+    let peer_id = {
+        let info = insts[2].get_core_instance().vpn_portal_info().await;
+        let client = info
+            .clients
+            .iter()
+            .find(|client| client.name == "roaming-client")
+            .expect("roaming client must be reported");
+        assert_eq!(client.state, PortalClientState::Online);
+        assert!(
+            client
+                .endpoint
+                .as_deref()
+                .is_some_and(|endpoint| endpoint.starts_with("10.1.2.4:")),
+            "unexpected endpoint before roaming: {:?}",
+            client.endpoint
+        );
+        client.peer_id
+    };
+    assert!(peer_id.is_some());
+
+    // 模拟客户端换网络：net_d 把地址从 10.1.2.4 换成 10.1.2.9。内核
+    // WireGuard 为 peer endpoint 缓存的源地址随旧地址一起失效，客户端
+    // 不重建 peer、不重新握手，直接用原 session 从新源继续发数据包，
+    // portal 应在数据路径上更新 endpoint
+    for args in [
+        vec![
+            "netns".to_owned(),
+            "exec".to_owned(),
+            "net_d".to_owned(),
+            "ip".to_owned(),
+            "addr".to_owned(),
+            "del".to_owned(),
+            "10.1.2.4/24".to_owned(),
+            "dev".to_owned(),
+            get_guest_veth_name("net_d").to_owned(),
+        ],
+        vec![
+            "netns".to_owned(),
+            "exec".to_owned(),
+            "net_d".to_owned(),
+            "ip".to_owned(),
+            "addr".to_owned(),
+            "add".to_owned(),
+            "10.1.2.9/24".to_owned(),
+            "dev".to_owned(),
+            get_guest_veth_name("net_d").to_owned(),
+        ],
+    ] {
+        let ret = std::process::Command::new("ip")
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            ret.status.success(),
+            "ip {args:?} failed: {}",
+            String::from_utf8_lossy(&ret.stderr)
+        );
+    }
+
+    // 驱动流量（ping 经内核 WireGuard 加密后从新源发出），portal 应在
+    // 同一个 peer 上更新 endpoint：peer_id 不变说明是同代漫游，客户端没有掉线重连
+    wait_for_condition(
+        || async {
+            ping_test("net_d", "10.144.144.1", None).await;
+            let info = insts[2].get_core_instance().vpn_portal_info().await;
+            info.clients.iter().any(|client| {
+                client.name == "roaming-client"
+                    && client.state == PortalClientState::Online
+                    && client.peer_id == peer_id
+                    && client
+                        .endpoint
+                        .as_deref()
+                        .is_some_and(|endpoint| endpoint.starts_with("10.1.2.9:"))
+            })
+        },
+        Duration::from_secs(20),
+    )
+    .await;
+
+    // 漫游后连通性保持
+    wait_for_condition(
+        || async { ping_test("net_d", "10.144.144.1", None).await },
+        Duration::from_secs(10),
+    )
+    .await;
+    wait_for_condition(
+        || async { ping_test("net_d", "10.144.144.3", None).await },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    drop_insts(insts).await;
+}
+
+#[cfg(feature = "wireguard")]
+#[tokio::test]
+#[serial_test::serial]
+pub async fn wireguard_vpn_portal_dynamic_clients() {
+    let insts = init_three_node_ex(
+        "tcp",
+        |config| {
+            let identity = config.get_network_identity();
+            config.set_network_identity(NetworkIdentity::new(
+                identity.network_name,
+                "wireguard-portal-dynamic-clients-test".to_owned(),
+            ));
+            if config.get_inst_name() == "inst3" {
+                config.set_vpn_portal_config(VpnPortalConfig {
+                    wireguard_listen: "0.0.0.0:22121".parse().unwrap(),
+                    wireguard_private_key: Some(BASE64_STANDARD.encode([42u8; 32])),
+                    clients: vec![VpnPortalClientConfig {
+                        name: "client-a".to_owned(),
+                        virtual_ip: "10.144.144.4/24".parse().unwrap(),
+                        groups: Vec::new(),
+                    }],
+                });
+            }
+            config
+        },
+        false,
+    )
+    .await;
+
+    let core = insts[2].get_core_instance();
+    let portal_config = insts[2]
+        .get_global_ctx()
+        .config
+        .get_vpn_portal_config()
+        .unwrap();
+
+    // 初始客户端上线
+    {
+        let net_ns = NetNS::new(Some("net_d".into()));
+        let _g = net_ns.guard();
+        let (server_public, client_private) =
+            test_wireguard_keys(&portal_config, "client-a").unwrap();
+        run_wireguard_client(
+            &wireguard_ifname("wg0"),
+            "10.1.2.3:22121".parse().unwrap(),
+            Key::try_from(server_public.as_slice()).unwrap(),
+            Key::try_from(client_private.as_slice()).unwrap(),
+            vec!["10.144.144.0/24".to_string()],
+            "10.144.144.4".to_owned(),
+        )
+        .unwrap();
+    }
+    wait_for_condition(
+        || async { ping_test("net_d", "10.144.144.1", None).await },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    // 不重启实例，通过配置补丁动态添加第二个客户端
+    easytier_core::management::apply_config_patch(
+        &core,
+        InstanceConfigPatch {
+            vpn_portal_clients: vec![VpnPortalClientPatch {
+                action: ConfigPatchAction::Add as i32,
+                client: Some(VpnPortalClientConfigPb {
+                    name: "client-b".to_owned(),
+                    virtual_ip: "10.144.144.5/24".to_owned(),
+                    groups: Vec::new(),
+                }),
+            }],
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        insts[2]
+            .get_global_ctx()
+            .config
+            .get_vpn_portal_config()
+            .unwrap()
+            .clients
+            .len(),
+        2,
+        "shared TOML model must reflect the runtime update"
+    );
+
+    // 拒绝的补丁不能污染共享 TOML 模型：重复添加 client-b 必须整体失败
+    let error = easytier_core::management::apply_config_patch(
+        &core,
+        InstanceConfigPatch {
+            vpn_portal_clients: vec![VpnPortalClientPatch {
+                action: ConfigPatchAction::Add as i32,
+                client: Some(VpnPortalClientConfigPb {
+                    name: "client-b".to_owned(),
+                    virtual_ip: "10.144.144.9/24".to_owned(),
+                    groups: Vec::new(),
+                }),
+            }],
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("duplicate VPN portal client name"),
+        "unexpected rejection reason: {error:#}"
+    );
+    assert_eq!(
+        insts[2]
+            .get_global_ctx()
+            .config
+            .get_vpn_portal_config()
+            .unwrap()
+            .clients
+            .len(),
+        2,
+        "rejected patch must leave the shared TOML model unchanged"
+    );
+
+    // 新客户端立即可以握手上线，原客户端不受影响
+    {
+        let net_ns = NetNS::new(Some("net_f".into()));
+        let _g = net_ns.guard();
+        let (server_public, client_private) =
+            test_wireguard_keys(&portal_config, "client-b").unwrap();
+        run_wireguard_client(
+            &wireguard_ifname("wg0"),
+            "10.1.2.3:22121".parse().unwrap(),
+            Key::try_from(server_public.as_slice()).unwrap(),
+            Key::try_from(client_private.as_slice()).unwrap(),
+            vec!["10.144.144.0/24".to_string()],
+            "10.144.144.5".to_owned(),
+        )
+        .unwrap();
+    }
+    wait_for_condition(
+        || async { ping_test("net_f", "10.144.144.1", None).await },
+        Duration::from_secs(10),
+    )
+    .await;
+    wait_for_condition(
+        || async { ping_test("net_d", "10.144.144.1", None).await },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    // 动态移除 client-a：其会话被拆除，client-b 保持在线
+    easytier_core::management::apply_config_patch(
+        &core,
+        InstanceConfigPatch {
+            vpn_portal_clients: vec![VpnPortalClientPatch {
+                action: ConfigPatchAction::Remove as i32,
+                client: Some(VpnPortalClientConfigPb {
+                    name: "client-a".to_owned(),
+                    virtual_ip: String::new(),
+                    groups: Vec::new(),
+                }),
+            }],
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    wait_for_condition(
+        || async { !ping_test("net_d", "10.144.144.1", None).await },
+        Duration::from_secs(20),
+    )
+    .await;
+    wait_for_condition(
+        || async { ping_test("net_f", "10.144.144.1", None).await },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    let info = core.vpn_portal_info().await;
+    assert_eq!(info.clients.len(), 1);
+    assert_eq!(info.clients[0].name, "client-b");
+    assert_eq!(info.clients[0].state, PortalClientState::Online);
+    assert_eq!(
+        info.clients[0].tunnel_ip,
+        Some("10.144.144.5".parse().unwrap())
+    );
+
+    // Release the held CoreInstance Arc so drop_insts can observe a clean
+    // drop instead of swallowing its debug assertion.
+    drop(core);
     drop_insts(insts).await;
 }
 
@@ -1155,56 +2427,49 @@ pub async fn socks5_vpn_portal(
 #[tokio::test]
 #[serial_test::serial]
 pub async fn foreign_network_functional_cluster() {
-    crate::set_global_var!(OSPF_UPDATE_MY_GLOBAL_FOREIGN_NETWORK_INTERVAL_SEC, 1);
     prepare_linux_namespaces();
+    let process_runtime = CoreProcessRuntime::new();
 
     let center_node_config1 = get_inst_config("inst1", Some("net_a"), "10.144.144.1", "fd00::1/64");
     center_node_config1
         .set_network_identity(NetworkIdentity::new("center".to_string(), "".to_string()));
-    let mut center_inst1 = Instance::new(center_node_config1);
+    let mut center_inst1 =
+        Instance::new_with_process_runtime(center_node_config1, process_runtime.clone());
 
     let center_node_config2 = get_inst_config("inst2", Some("net_b"), "10.144.144.2", "fd00::2/64");
     center_node_config2
         .set_network_identity(NetworkIdentity::new("center".to_string(), "".to_string()));
-    let mut center_inst2 = Instance::new(center_node_config2);
+    let mut center_inst2 =
+        Instance::new_with_process_runtime(center_node_config2, process_runtime.clone());
 
     let inst1_config = get_inst_config("inst1", Some("net_c"), "10.144.145.1", "fd00:2::1/64");
     inst1_config.set_listeners(vec![]);
-    let mut inst1 = Instance::new(inst1_config);
+    let mut inst1 = Instance::new_with_process_runtime(inst1_config, process_runtime.clone());
 
-    let mut inst2 = Instance::new(get_inst_config(
-        "inst2",
-        Some("net_d"),
-        "10.144.145.2",
-        "fd00:2::2/64",
-    ));
+    let mut inst2 = Instance::new_with_process_runtime(
+        get_inst_config("inst2", Some("net_d"), "10.144.145.2", "fd00:2::2/64"),
+        process_runtime,
+    );
 
     center_inst1.run().await.unwrap();
     center_inst2.run().await.unwrap();
     inst1.run().await.unwrap();
     inst2.run().await.unwrap();
 
-    center_inst1
-        .get_conn_manager()
-        .add_connector(RingTunnelConnector::new(
-            format!("ring://{}", center_inst2.id()).parse().unwrap(),
-        ));
+    for instance in [&center_inst1, &center_inst2, &inst1, &inst2] {
+        set_foreign_network_refresh_interval(instance, 1).await;
+    }
 
-    inst1
-        .get_conn_manager()
-        .add_connector(RingTunnelConnector::new(
-            format!("ring://{}", center_inst1.id()).parse().unwrap(),
-        ));
+    center_inst1.add_connector_url(center_inst2.ring_listener_url());
 
-    inst2
-        .get_conn_manager()
-        .add_connector(RingTunnelConnector::new(
-            format!("ring://{}", center_inst2.id()).parse().unwrap(),
-        ));
+    inst1.add_connector_url(center_inst1.ring_listener_url());
 
-    let peer_map_inst1 = inst1.get_peer_manager();
-    println!("inst1 peer map: {:?}", peer_map_inst1.list_routes().await);
-    drop(peer_map_inst1);
+    inst2.add_connector_url(center_inst2.ring_listener_url());
+
+    println!(
+        "inst1 peer map: {:?}",
+        inst1.get_core_instance().route_snapshots().await
+    );
 
     wait_for_condition(
         || async { ping_test("net_c", "10.144.145.2", None).await },
@@ -1213,11 +2478,7 @@ pub async fn foreign_network_functional_cluster() {
     .await;
 
     // connect to two centers, ping should work
-    inst1
-        .get_conn_manager()
-        .add_connector(RingTunnelConnector::new(
-            format!("ring://{}", center_inst2.id()).parse().unwrap(),
-        ));
+    inst1.add_connector_url(center_inst2.ring_listener_url());
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
     wait_for_condition(
         || async { ping_test("net_c", "10.144.145.2", None).await },
@@ -1233,67 +2494,60 @@ pub async fn foreign_network_functional_cluster() {
 #[serial_test::serial]
 pub async fn manual_reconnector(#[values(true, false)] is_foreign: bool) {
     prepare_linux_namespaces();
+    let process_runtime = CoreProcessRuntime::new();
 
     let center_node_config = get_inst_config("inst1", Some("net_a"), "10.144.144.1", "fd00::1/64");
     if is_foreign {
         center_node_config
             .set_network_identity(NetworkIdentity::new("center".to_string(), "".to_string()));
     }
-    let mut center_inst = Instance::new(center_node_config);
+    let mut center_inst =
+        Instance::new_with_process_runtime(center_node_config, process_runtime.clone());
 
     let inst1_config = get_inst_config("inst1", Some("net_b"), "10.144.145.1", "fd00:1::1/64");
     inst1_config.set_listeners(vec![]);
-    let mut inst1 = Instance::new(inst1_config);
+    let mut inst1 = Instance::new_with_process_runtime(inst1_config, process_runtime.clone());
 
-    let mut inst2 = Instance::new(get_inst_config(
-        "inst2",
-        Some("net_c"),
-        "10.144.145.2",
-        "fd00:1::2/64",
-    ));
+    let mut inst2 = Instance::new_with_process_runtime(
+        get_inst_config("inst2", Some("net_c"), "10.144.145.2", "fd00:1::2/64"),
+        process_runtime,
+    );
 
     center_inst.run().await.unwrap();
     inst1.run().await.unwrap();
     inst2.run().await.unwrap();
 
-    assert_ne!(inst1.id(), center_inst.id());
-    assert_ne!(inst2.id(), center_inst.id());
+    assert_ne!(inst1.ring_listener_url(), center_inst.ring_listener_url());
+    assert_ne!(inst2.ring_listener_url(), center_inst.ring_listener_url());
 
-    inst1
-        .get_conn_manager()
-        .add_connector(RingTunnelConnector::new(
-            format!("ring://{}", center_inst.id()).parse().unwrap(),
-        ));
+    inst1.add_connector_url(center_inst.ring_listener_url());
 
-    inst2
-        .get_conn_manager()
-        .add_connector(RingTunnelConnector::new(
-            format!("ring://{}", center_inst.id()).parse().unwrap(),
-        ));
+    inst2.add_connector_url(center_inst.ring_listener_url());
 
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
-    let peer_map = if !is_foreign {
-        inst1.get_peer_manager().get_peer_map()
-    } else {
-        inst1
-            .get_peer_manager()
-            .get_foreign_network_client()
-            .get_peer_map()
-    };
     let center_inst_peer_id = if !is_foreign {
         center_inst.peer_id()
     } else {
+        let network_name = inst1.get_global_ctx().get_network_identity().network_name;
         center_inst
-            .get_peer_manager()
-            .get_foreign_network_manager()
-            .get_network_peer_id(&inst1.get_global_ctx().get_network_identity().network_name)
+            .get_core_instance()
+            .foreign_network_snapshots(false)
+            .await
+            .get(&network_name)
+            .map(|network| network.my_peer_id_for_this_network)
             .unwrap()
     };
 
-    let conns = peer_map.list_peer_conns(center_inst_peer_id).await.unwrap();
+    let conns_len = inst1
+        .get_core_instance()
+        .peer_snapshots()
+        .await
+        .into_iter()
+        .find(|peer| peer.peer_id == center_inst_peer_id)
+        .map_or(0, |peer| peer.conns.len());
 
-    assert!(!conns.is_empty());
+    assert!(conns_len > 0);
 
     wait_for_condition(
         || async { ping_test("net_b", "10.144.145.2", None).await },
@@ -1301,7 +2555,6 @@ pub async fn manual_reconnector(#[values(true, false)] is_foreign: bool) {
     )
     .await;
 
-    drop(peer_map);
     drop_insts(vec![center_inst, inst1, inst2]).await;
 }
 
@@ -1370,72 +2623,192 @@ pub async fn port_forward_test(
     )
     .await;
 
-    use crate::tunnel::{
-        common::tests::_tunnel_pingpong_netns, tcp::TcpTunnelListener, udp::UdpTunnelConnector,
-        udp::UdpTunnelListener,
-    };
-
-    let tcp_listener = TcpTunnelListener::new("tcp://0.0.0.0:23456".parse().unwrap());
-    let tcp_connector = TcpTunnelConnector::new("tcp://127.0.0.1:23456".parse().unwrap());
+    let tcp_listener = core_tcp_listener("tcp://0.0.0.0:23456".parse().unwrap());
+    let tcp_connector = core_tcp_dialer("tcp://127.0.0.1:23456".parse().unwrap());
 
     let mut buf = vec![0; buf_size as usize];
     rand::thread_rng().fill(&mut buf[..]);
 
-    _tunnel_pingpong_netns(
+    _tunnel_pingpong_netns_with_timeout(
         tcp_listener,
         tcp_connector,
         NetNS::new(Some("net_c".into())),
         NetNS::new(Some("net_a".into())),
         buf,
+        Duration::from_secs(1),
     )
-    .await;
+    .await
+    .unwrap();
 
-    let tcp_listener = TcpTunnelListener::new("tcp://0.0.0.0:23457".parse().unwrap());
-    let tcp_connector = TcpTunnelConnector::new("tcp://127.0.0.1:23457".parse().unwrap());
+    let tcp_listener = core_tcp_listener("tcp://0.0.0.0:23457".parse().unwrap());
+    let tcp_connector = core_tcp_dialer("tcp://127.0.0.1:23457".parse().unwrap());
 
     let mut buf = vec![0; buf_size as usize];
     rand::thread_rng().fill(&mut buf[..]);
 
-    _tunnel_pingpong_netns(
+    _tunnel_pingpong_netns_with_timeout(
         tcp_listener,
         tcp_connector,
         NetNS::new(Some("net_d".into())),
         NetNS::new(Some("net_a".into())),
         buf,
+        Duration::from_secs(1),
     )
-    .await;
+    .await
+    .unwrap();
 
-    let udp_listener = UdpTunnelListener::new("udp://0.0.0.0:23458".parse().unwrap());
-    let udp_connector = UdpTunnelConnector::new("udp://127.0.0.1:23458".parse().unwrap());
+    let udp_listener = core_udp_listener("udp://0.0.0.0:23458".parse().unwrap());
+    let udp_connector = core_udp_dialer("udp://127.0.0.1:23458".parse().unwrap());
 
     let mut buf = vec![0; buf_size as usize];
     rand::thread_rng().fill(&mut buf[..]);
 
-    _tunnel_pingpong_netns(
+    _tunnel_pingpong_netns_with_timeout(
         udp_listener,
         udp_connector,
         NetNS::new(Some("net_c".into())),
         NetNS::new(Some("net_a".into())),
         buf,
+        Duration::from_secs(1),
     )
-    .await;
+    .await
+    .unwrap();
 
-    let udp_listener = UdpTunnelListener::new("udp://0.0.0.0:23459".parse().unwrap());
-    let udp_connector = UdpTunnelConnector::new("udp://127.0.0.1:23459".parse().unwrap());
+    let udp_listener = core_udp_listener("udp://0.0.0.0:23459".parse().unwrap());
+    let udp_connector = core_udp_dialer("udp://127.0.0.1:23459".parse().unwrap());
 
     let mut buf = vec![0; buf_size as usize];
     rand::thread_rng().fill(&mut buf[..]);
 
-    _tunnel_pingpong_netns(
+    _tunnel_pingpong_netns_with_timeout(
         udp_listener,
         udp_connector,
         NetNS::new(Some("net_d".into())),
         NetNS::new(Some("net_a".into())),
         buf,
+        Duration::from_secs(1),
     )
-    .await;
+    .await
+    .unwrap();
 
     drop_insts(_insts).await;
+}
+
+#[rstest::rstest]
+#[case(false, false)]
+#[case(true, false)]
+#[case(true, true)]
+#[serial_test::serial]
+#[tokio::test]
+pub async fn port_forward_with_inbound_default_drop_acl_test(
+    #[case] dhcp: bool,
+    #[case] enable_quic_proxy: bool,
+) {
+    use crate::proto::acl::*;
+
+    let acl = Acl {
+        acl_v1: Some(AclV1 {
+            chains: vec![Chain {
+                name: "drop_unsolicited_inbound".to_string(),
+                chain_type: ChainType::Inbound as i32,
+                enabled: true,
+                default_action: Action::Drop as i32,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+    };
+
+    let insts = init_three_node_ex(
+        "udp",
+        |cfg| {
+            if cfg.get_inst_name() == "inst1" {
+                if dhcp {
+                    cfg.set_ipv4(None);
+                    cfg.set_dhcp(true);
+                }
+                cfg.set_acl(Some(acl.clone()));
+                cfg.set_port_forwards(vec![
+                    PortForwardConfig {
+                        bind_addr: "0.0.0.0:23456".parse().unwrap(),
+                        dst_addr: "10.144.144.3:23456".parse().unwrap(),
+                        proto: "tcp".to_string(),
+                    },
+                    PortForwardConfig {
+                        bind_addr: "0.0.0.0:23457".parse().unwrap(),
+                        dst_addr: "10.1.2.4:23457".parse().unwrap(),
+                        proto: "tcp".to_string(),
+                    },
+                ]);
+
+                let mut flags = cfg.get_flags();
+                flags.no_tun = true;
+                flags.enable_kcp_proxy = false;
+                flags.enable_quic_proxy = enable_quic_proxy;
+                cfg.set_flags(flags);
+            } else if cfg.get_inst_name() == "inst3" {
+                cfg.add_proxy_cidr("10.1.2.0/24".parse().unwrap(), None)
+                    .unwrap();
+
+                let mut flags = cfg.get_flags();
+                flags.disable_kcp_input = true;
+                flags.disable_quic_input = !enable_quic_proxy;
+                cfg.set_flags(flags);
+            } else if cfg.get_inst_name() == "inst2" {
+                let mut flags = cfg.get_flags();
+                flags.disable_relay_kcp = true;
+                cfg.set_flags(flags);
+            }
+
+            cfg
+        },
+        false,
+    )
+    .await;
+
+    if dhcp {
+        wait_for_condition(
+            || async { insts[0].get_global_ctx().get_ipv4().is_some() },
+            Duration::from_secs(5),
+        )
+        .await;
+    }
+
+    for (bind_port, server_ns) in [(23456, "net_c"), (23457, "net_d")] {
+        let tcp_listener = core_tcp_listener(format!("tcp://0.0.0.0:{bind_port}").parse().unwrap());
+        let tcp_connector =
+            core_tcp_dialer(format!("tcp://127.0.0.1:{bind_port}").parse().unwrap());
+
+        let mut buf = vec![0; 64];
+        rand::thread_rng().fill(&mut buf[..]);
+
+        let result = _tunnel_pingpong_netns_with_timeout(
+            tcp_listener,
+            tcp_connector,
+            NetNS::new(Some(server_ns.into())),
+            NetNS::new(Some("net_a".into())),
+            buf,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        let stats = insts[0].get_core_instance().acl_stats();
+        println!(
+            "port forward source bind_port={} dhcp={} enable_quic_proxy={} ACL stats: {}",
+            bind_port, dhcp, enable_quic_proxy, stats
+        );
+
+        assert!(
+            result.is_ok(),
+            "port-forward TCP should complete through outbound ACL state, bind_port={}, dhcp={}, enable_quic_proxy={}; stats: {}",
+            bind_port,
+            dhcp,
+            enable_quic_proxy,
+            stats,
+        );
+    }
+
+    drop_insts(insts).await;
 }
 
 #[rstest::rstest]
@@ -1461,8 +2834,8 @@ pub async fn relay_bps_limit_test(#[values(100, 200, 400, 800)] bps_limit: u64) 
     .await;
 
     // connect to virtual ip (no tun mode)
-    let tcp_listener = TcpTunnelListener::new("tcp://0.0.0.0:22223".parse().unwrap());
-    let tcp_connector = TcpTunnelConnector::new("tcp://10.144.144.3:22223".parse().unwrap());
+    let tcp_listener = core_tcp_listener("tcp://0.0.0.0:22223".parse().unwrap());
+    let tcp_connector = core_tcp_dialer("tcp://10.144.144.3:22223".parse().unwrap());
 
     let bps = _tunnel_bench_netns(
         tcp_listener,
@@ -1475,31 +2848,187 @@ pub async fn relay_bps_limit_test(#[values(100, 200, 400, 800)] bps_limit: u64) 
     println!("bps: {}", bps);
 
     let bps = bps as u64 / 1024;
-    // allow 50kb jitter
-    assert!(bps >= bps_limit - 50 && bps <= bps_limit + 50);
+    assert_limited_payload_bps(bps, bps_limit);
 
     drop_insts(insts).await;
 }
 
+#[rstest::rstest]
+#[serial_test::serial]
 #[tokio::test]
-async fn avoid_tunnel_loop_back_to_virtual_network() {
-    let insts = init_three_node("udp").await;
+pub async fn instance_recv_bps_limit_test(#[values(100, 800)] bps_limit: u64) {
+    let insts = init_three_node_ex(
+        "tcp",
+        |cfg| {
+            if cfg.get_inst_name() == "inst2" {
+                let mut f = cfg.get_flags();
+                f.instance_recv_bps_limit = bps_limit * 1024;
+                cfg.set_flags(f);
+            }
+            cfg
+        },
+        false,
+    )
+    .await;
 
-    let tcp_connector = TcpTunnelConnector::new("tcp://10.144.144.2:11010".parse().unwrap());
-    insts[0]
-        .get_peer_manager()
-        .try_direct_connect(tcp_connector)
-        .await
-        .unwrap_err();
+    let tcp_listener = core_tcp_listener("tcp://0.0.0.0:22223".parse().unwrap());
+    let tcp_connector = core_tcp_dialer("tcp://10.144.144.3:22223".parse().unwrap());
 
-    let udp_connector = UdpTunnelConnector::new("udp://10.144.144.3:11010".parse().unwrap());
-    insts[0]
-        .get_peer_manager()
-        .try_direct_connect(udp_connector)
-        .await
-        .unwrap_err();
+    let bps = _tunnel_bench_netns(
+        tcp_listener,
+        tcp_connector,
+        NetNS::new(Some("net_c".into())),
+        NetNS::new(Some("net_a".into())),
+    )
+    .await;
+
+    println!("bps: {}", bps);
+
+    let bps = bps as u64 / 1024;
+    assert_limited_payload_bps(bps, bps_limit);
 
     drop_insts(insts).await;
+}
+
+fn assert_limited_payload_bps(bps: u64, bps_limit: u64) {
+    // The benchmark measures TCP application payload while the limiter counts
+    // EasyTier data payload, including the inner IP and transport headers.
+    let min_bps = bps_limit.saturating_sub((bps_limit / 10).max(50));
+    let max_bps = bps_limit + 50;
+    assert!(
+        bps >= min_bps && bps <= max_bps,
+        "bps: {}, expected: {}..={}",
+        bps,
+        min_bps,
+        max_bps
+    );
+}
+
+async fn assert_peer_admission_blocked(inst: &Instance, url: url::Url) {
+    let ip = url
+        .host_str()
+        .expect("test URL should have a host")
+        .parse()
+        .expect("test URL should have a literal IP");
+    let target = std::net::SocketAddr::new(ip, url.port().expect("test URL should have a port"));
+    let host = crate::instance::host::native_instance_host(inst.get_global_ctx());
+    let protocol = crate::tunnel::protocol::runtime_client_protocol_upgrader(inst.get_global_ctx());
+    let core = inst.get_core_instance();
+    let connect = async {
+        let connected = match url.scheme() {
+            "tcp" => easytier_core::connectivity::transport::ConnectedTransport::Tcp(
+                easytier_core::socket::tcp::VirtualTcpSocketFactory::connect_tcp(
+                    host.as_ref(),
+                    easytier_core::socket::tcp::TcpConnectOptions::direct_connect(target),
+                )
+                .await?,
+            ),
+            "udp" => easytier_core::connectivity::transport::ConnectedTransport::Udp(
+                easytier_core::connectivity::transport::connect_udp(
+                    host,
+                    target,
+                    Vec::new(),
+                    easytier_core::socket::udp::UdpBindOptions::direct_connect(),
+                    easytier_core::connectivity::transport::UdpSessionMode::EasyTierMux,
+                )
+                .await?,
+            ),
+            scheme => panic!("unsupported test scheme: {scheme}"),
+        };
+        let tunnel = easytier_core::connectivity::protocol::ClientProtocolUpgrader::upgrade_client(
+            protocol.as_ref(),
+            connected,
+            url,
+        )
+        .await?;
+        core.admit_client_tunnel_for_test(tunnel, true)
+            .await
+            .map(|_| ())
+            .map_err(anyhow::Error::from)
+    };
+    let result = tokio::time::timeout(Duration::from_millis(100), connect).await;
+    assert!(matches!(result, Err(_) | Ok(Err(_))));
+}
+
+use std::fs;
+use std::io;
+
+fn print_all_fds() -> io::Result<()> {
+    let fd_dir = "/proc/self/fd";
+
+    // 读取 /proc/self/fd 目录中的所有条目
+    for entry in fs::read_dir(fd_dir)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let fd_str = file_name.to_string_lossy();
+
+        // 尝试解析为数字（跳过 . 和 ..）
+        if let Ok(fd_num) = fd_str.parse::<i32>() {
+            // 获取文件描述符指向的文件路径（如果可能）
+            let target_path = format!("{}/{}", fd_dir, fd_num);
+            match fs::read_link(&target_path) {
+                Ok(target) => {
+                    println!("FD {}: {}", fd_num, target.to_string_lossy());
+                }
+                Err(e) => {
+                    println!("FD {}: (unreadable: {})", fd_num, e);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[rstest::rstest]
+#[serial_test::serial]
+#[tokio::test]
+async fn avoid_tunnel_loop_back_to_virtual_network(
+    #[values(true, false)] no_tun: bool,
+    #[values(true, false)] enable_kcp_proxy: bool,
+    #[values(true, false)] enable_quic_proxy: bool,
+) {
+    if enable_kcp_proxy && enable_quic_proxy {
+        return;
+    }
+
+    let insts = init_three_node_ex(
+        "udp",
+        |cfg| {
+            if matches!(cfg.get_inst_name().as_str(), "inst2" | "inst3") {
+                let mut flags = cfg.get_flags();
+                flags.no_tun = no_tun;
+                cfg.set_flags(flags);
+            }
+
+            if cfg.get_inst_name().as_str() == "inst1" {
+                let mut flags = cfg.get_flags();
+                flags.enable_kcp_proxy = enable_kcp_proxy;
+                flags.enable_quic_proxy = enable_quic_proxy;
+                cfg.set_flags(flags);
+            }
+
+            if cfg.get_inst_name().as_str() == "inst3" {
+                cfg.add_proxy_cidr("10.1.2.0/24".parse().unwrap(), None)
+                    .unwrap();
+            }
+
+            cfg
+        },
+        false,
+    )
+    .await;
+
+    assert_peer_admission_blocked(&insts[0], "tcp://10.144.144.2:11010".parse().unwrap()).await;
+
+    assert_peer_admission_blocked(&insts[0], "udp://10.144.144.3:11010".parse().unwrap()).await;
+
+    assert_peer_admission_blocked(&insts[0], "tcp://10.1.2.3:11010".parse().unwrap()).await;
+
+    assert_peer_admission_blocked(&insts[0], "udp://10.1.2.3:11010".parse().unwrap()).await;
+
+    drop_insts(insts).await;
+
+    let _ = print_all_fds();
 }
 
 #[rstest::rstest]
@@ -1509,11 +3038,7 @@ pub async fn acl_rule_test_inbound(
     #[values(true, false)] enable_kcp_proxy: bool,
     #[values(true, false)] enable_quic_proxy: bool,
 ) {
-    use crate::tunnel::{
-        common::tests::_tunnel_pingpong_netns,
-        tcp::{TcpTunnelConnector, TcpTunnelListener},
-        udp::{UdpTunnelConnector, UdpTunnelListener},
-    };
+    use crate::tunnel::common::tests::_tunnel_pingpong_netns_with_timeout;
     use rand::Rng;
     let insts = init_three_node_ex(
         "udp",
@@ -1585,127 +3110,116 @@ pub async fn acl_rule_test_inbound(
     let acl_toml = toml::to_string(&acl).unwrap();
     println!("ACL TOML: {}", acl_toml);
 
-    insts[2]
-        .get_global_ctx()
-        .get_acl_filter()
-        .reload_rules(Some(&acl));
+    reload_instance_acl(&insts[2], Some(&acl)).await;
 
     // TCP 测试部分
     {
         // 2. 在 inst2 上监听 8080 和 8081
-        let listener_8080 = TcpTunnelListener::new("tcp://0.0.0.0:8080".parse().unwrap());
-        let listener_8081 = TcpTunnelListener::new("tcp://0.0.0.0:8081".parse().unwrap());
-        let listener_8082 = TcpTunnelListener::new("tcp://0.0.0.0:8082".parse().unwrap());
+        let listener_8080 = core_tcp_listener("tcp://0.0.0.0:8080".parse().unwrap());
+        let listener_8081 = core_tcp_listener("tcp://0.0.0.0:8081".parse().unwrap());
+        let listener_8082 = core_tcp_listener("tcp://0.0.0.0:8082".parse().unwrap());
 
         // 3. inst1 作为客户端，尝试连接 inst2 的 8080（应被拒绝）和 8081（应被允许）
         let connector_8080 =
-            TcpTunnelConnector::new(format!("tcp://{}:8080", "10.144.144.3").parse().unwrap());
+            core_tcp_dialer(format!("tcp://{}:8080", "10.144.144.3").parse().unwrap());
         let connector_8081 =
-            TcpTunnelConnector::new(format!("tcp://{}:8081", "10.144.144.3").parse().unwrap());
+            core_tcp_dialer(format!("tcp://{}:8081", "10.144.144.3").parse().unwrap());
         let connector_8082 =
-            TcpTunnelConnector::new(format!("tcp://{}:8082", "10.144.144.3").parse().unwrap());
+            core_tcp_dialer(format!("tcp://{}:8082", "10.144.144.3").parse().unwrap());
 
         // 4. 构造测试数据
         let mut buf = vec![0; 32];
         rand::thread_rng().fill(&mut buf[..]);
 
         // 5. 8081 应该可以 pingpong 成功
-        _tunnel_pingpong_netns(
+        let result = _tunnel_pingpong_netns_with_timeout(
             listener_8081,
             connector_8081,
             NetNS::new(Some("net_c".into())),
             NetNS::new(Some("net_a".into())),
             buf.clone(),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(result.is_ok(), "{}", result.unwrap_err());
+
+        // 6. 8080 应该连接失败（被 ACL 拦截）
+        let result = _tunnel_pingpong_netns_with_timeout(
+            listener_8080,
+            connector_8080,
+            NetNS::new(Some("net_c".into())),
+            NetNS::new(Some("net_a".into())),
+            buf.clone(),
+            Duration::from_millis(500),
         )
         .await;
 
-        // 6. 8080 应该连接失败（被 ACL 拦截）
-        let result = tokio::spawn(tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            _tunnel_pingpong_netns(
-                listener_8080,
-                connector_8080,
-                NetNS::new(Some("net_c".into())),
-                NetNS::new(Some("net_a".into())),
-                buf.clone(),
-            ),
-        ))
-        .await;
-
-        assert!(
-            result.is_err() || result.unwrap().is_err(),
-            "TCP 连接 8080 应被 ACL 拦截，不能成功"
-        );
+        assert!(result.is_err(), "TCP 连接 8080 应被 ACL 拦截，不能成功");
 
         // 7. 从 10.144.144.2 连接 8082 应该连接失败（被 ACL 拦截）
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            _tunnel_pingpong_netns(
-                listener_8082,
-                connector_8082,
-                NetNS::new(Some("net_c".into())),
-                NetNS::new(Some("net_b".into())),
-                buf.clone(),
-            ),
+        let result = _tunnel_pingpong_netns_with_timeout(
+            listener_8082,
+            connector_8082,
+            NetNS::new(Some("net_c".into())),
+            NetNS::new(Some("net_b".into())),
+            buf.clone(),
+            Duration::from_millis(500),
         )
         .await;
 
         assert!(result.is_err(), "TCP 连接 8082 应被 ACL 拦截，不能成功");
 
-        let stats = insts[2].get_global_ctx().get_acl_filter().get_stats();
+        let stats = insts[2].get_core_instance().acl_stats();
         println!("stats: {:?}", stats);
     }
 
     // UDP 测试部分
     {
         // 1. 在 inst2 上监听 UDP 8080 和 8081
-        let listener_8080 = UdpTunnelListener::new("udp://0.0.0.0:8080".parse().unwrap());
-        let listener_8081 = UdpTunnelListener::new("udp://0.0.0.0:8081".parse().unwrap());
+        let listener_8080 = core_udp_listener("udp://0.0.0.0:8080".parse().unwrap());
+        let listener_8081 = core_udp_listener("udp://0.0.0.0:8081".parse().unwrap());
 
         // 2. inst1 作为客户端，尝试连接 inst2 的 8080（应被拒绝）和 8081（应被允许）
         let connector_8080 =
-            UdpTunnelConnector::new(format!("udp://{}:8080", "10.144.144.3").parse().unwrap());
+            core_udp_dialer(format!("udp://{}:8080", "10.144.144.3").parse().unwrap());
         let connector_8081 =
-            UdpTunnelConnector::new(format!("udp://{}:8081", "10.144.144.3").parse().unwrap());
+            core_udp_dialer(format!("udp://{}:8081", "10.144.144.3").parse().unwrap());
 
         // 3. 构造测试数据
         let mut buf = vec![0; 32];
         rand::thread_rng().fill(&mut buf[..]);
 
         // 4. 8081 应该可以 pingpong 成功
-        _tunnel_pingpong_netns(
+        let result = _tunnel_pingpong_netns_with_timeout(
             listener_8081,
             connector_8081,
             NetNS::new(Some("net_c".into())),
             NetNS::new(Some("net_a".into())),
             buf.clone(),
+            Duration::from_secs(5),
         )
         .await;
+        assert!(result.is_ok(), "{}", result.unwrap_err());
 
         // 5. 8080 应该连接失败（被 ACL 拦截）
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            _tunnel_pingpong_netns(
-                listener_8080,
-                connector_8080,
-                NetNS::new(Some("net_c".into())),
-                NetNS::new(Some("net_a".into())),
-                buf.clone(),
-            ),
+        let result = _tunnel_pingpong_netns_with_timeout(
+            listener_8080,
+            connector_8080,
+            NetNS::new(Some("net_c".into())),
+            NetNS::new(Some("net_a".into())),
+            buf.clone(),
+            Duration::from_millis(500),
         )
         .await;
 
         assert!(result.is_err(), "UDP 连接 8080 应被 ACL 拦截，不能成功");
 
-        let stats = insts[2].get_global_ctx().get_acl_filter().get_stats();
+        let stats = insts[2].get_core_instance().acl_stats();
         println!("stats: {}", stats);
     }
 
     // remove acl, 8080 should succ
-    insts[2]
-        .get_global_ctx()
-        .get_acl_filter()
-        .reload_rules(None);
+    reload_instance_acl(&insts[2], None).await;
 
     drop_insts(insts).await;
 }
@@ -1717,11 +3231,7 @@ pub async fn acl_rule_test_subnet_proxy(
     #[values(true, false)] enable_kcp_proxy: bool,
     #[values(true, false)] enable_quic_proxy: bool,
 ) {
-    use crate::tunnel::{
-        common::tests::_tunnel_pingpong_netns,
-        tcp::{TcpTunnelConnector, TcpTunnelListener},
-        udp::{UdpTunnelConnector, UdpTunnelListener},
-    };
+    use crate::tunnel::common::tests::_tunnel_pingpong_netns_with_timeout;
     use rand::Rng;
 
     let insts = init_three_node_ex(
@@ -1745,7 +3255,7 @@ pub async fn acl_rule_test_subnet_proxy(
 
     // 等待代理路由出现
     wait_proxy_route_appear(
-        &insts[0].get_peer_manager(),
+        &insts[0].get_core_instance(),
         "10.144.144.3/24",
         insts[2].peer_id(),
         "10.1.2.0/24",
@@ -1814,111 +3324,106 @@ pub async fn acl_rule_test_subnet_proxy(
     acl.acl_v1 = Some(acl_v1);
 
     // 在 inst3 上应用 ACL 规则
-    insts[2]
-        .get_global_ctx()
-        .get_acl_filter()
-        .reload_rules(Some(&acl));
+    reload_instance_acl(&insts[2], Some(&acl)).await;
 
     // TCP 测试部分 - 测试子网代理的 ACL 规则
     {
         // 在 net_d (10.1.2.4) 上监听多个端口
-        let listener_8080 = TcpTunnelListener::new("tcp://0.0.0.0:8080".parse().unwrap());
-        let listener_8081 = TcpTunnelListener::new("tcp://0.0.0.0:8081".parse().unwrap());
-        let listener_8082 = TcpTunnelListener::new("tcp://0.0.0.0:8082".parse().unwrap());
+        let listener_8080 = core_tcp_listener("tcp://0.0.0.0:8080".parse().unwrap());
+        let listener_8081 = core_tcp_listener("tcp://0.0.0.0:8081".parse().unwrap());
+        let listener_8082 = core_tcp_listener("tcp://0.0.0.0:8082".parse().unwrap());
 
         // 从 inst1 (net_a) 连接到子网代理
-        let connector_8080 = TcpTunnelConnector::new("tcp://10.1.2.4:8080".parse().unwrap());
-        let connector_8081 = TcpTunnelConnector::new("tcp://10.1.2.4:8081".parse().unwrap());
-        let connector_8082 = TcpTunnelConnector::new("tcp://10.1.2.4:8082".parse().unwrap());
+        let connector_8080 = core_tcp_dialer("tcp://10.1.2.4:8080".parse().unwrap());
+        let connector_8081 = core_tcp_dialer("tcp://10.1.2.4:8081".parse().unwrap());
+        let connector_8082 = core_tcp_dialer("tcp://10.1.2.4:8082".parse().unwrap());
 
         let mut buf = vec![0; 32];
         rand::thread_rng().fill(&mut buf[..]);
 
         // 8082 应该可以连接成功（不被 ACL 拦截）
-        _tunnel_pingpong_netns(
+        let result = _tunnel_pingpong_netns_with_timeout(
             listener_8082,
             connector_8082,
             NetNS::new(Some("net_d".into())),
             NetNS::new(Some("net_a".into())),
             buf.clone(),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(result.is_ok(), "{}", result.unwrap_err());
+
+        // 8080 应该连接失败（被 ACL 拦截 - 禁止访问子网代理的 8080）
+        let result = _tunnel_pingpong_netns_with_timeout(
+            listener_8080,
+            connector_8080,
+            NetNS::new(Some("net_d".into())),
+            NetNS::new(Some("net_a".into())),
+            buf.clone(),
+            Duration::from_millis(500),
         )
         .await;
 
-        // 8080 应该连接失败（被 ACL 拦截 - 禁止访问子网代理的 8080）
-        let result = tokio::spawn(tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            _tunnel_pingpong_netns(
-                listener_8080,
-                connector_8080,
-                NetNS::new(Some("net_d".into())),
-                NetNS::new(Some("net_a".into())),
-                buf.clone(),
-            ),
-        ))
-        .await;
-
         assert!(
-            result.is_err() || result.unwrap().is_err(),
+            result.is_err(),
             "TCP 连接子网代理 8080 应被 ACL 拦截，不能成功"
         );
 
         // 8081 应该连接失败（被 ACL 拦截 - 禁止 inst1 访问子网代理的 8081）
-        let result = tokio::spawn(tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            _tunnel_pingpong_netns(
-                listener_8081,
-                connector_8081,
-                NetNS::new(Some("net_d".into())),
-                NetNS::new(Some("net_a".into())),
-                buf.clone(),
-            ),
-        ))
+        let result = _tunnel_pingpong_netns_with_timeout(
+            listener_8081,
+            connector_8081,
+            NetNS::new(Some("net_d".into())),
+            NetNS::new(Some("net_a".into())),
+            buf.clone(),
+            Duration::from_millis(500),
+        )
         .await;
 
         assert!(
-            result.is_err() || result.unwrap().is_err(),
+            result.is_err(),
             "TCP 连接子网代理 8081 应被 ACL 拦截，不能成功"
         );
 
-        let stats = insts[2].get_global_ctx().get_acl_filter().get_stats();
+        let stats = insts[2].get_core_instance().acl_stats();
         println!("ACL stats after TCP tests: {:?}", stats);
     }
 
     // UDP 测试部分 - 测试子网代理的 ACL 规则
     {
-        let listener_8080 = UdpTunnelListener::new("udp://0.0.0.0:8080".parse().unwrap());
-        let listener_8082 = UdpTunnelListener::new("udp://0.0.0.0:8082".parse().unwrap());
+        let listener_8080 = core_udp_listener("udp://0.0.0.0:8080".parse().unwrap());
+        let listener_8082 = core_udp_listener("udp://0.0.0.0:8082".parse().unwrap());
 
-        let connector_8080 = UdpTunnelConnector::new("udp://10.1.2.4:8080".parse().unwrap());
-        let connector_8082 = UdpTunnelConnector::new("udp://10.1.2.4:8082".parse().unwrap());
+        let connector_8080 = core_udp_dialer("udp://10.1.2.4:8080".parse().unwrap());
+        let connector_8082 = core_udp_dialer("udp://10.1.2.4:8082".parse().unwrap());
 
         let mut buf = vec![0; 32];
         rand::thread_rng().fill(&mut buf[..]);
 
         // 8082 应该可以连接成功
-        _tunnel_pingpong_netns(
+        let result = _tunnel_pingpong_netns_with_timeout(
             listener_8082,
             connector_8082,
             NetNS::new(Some("net_d".into())),
             NetNS::new(Some("net_a".into())),
             buf.clone(),
+            Duration::from_secs(5),
         )
         .await;
+        assert!(result.is_ok(), "{}", result.unwrap_err());
 
         // 8080 应该连接失败（被 ACL 拦截）
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            _tunnel_pingpong_netns(
-                listener_8080,
-                connector_8080,
-                NetNS::new(Some("net_d".into())),
-                NetNS::new(Some("net_a".into())),
-                buf.clone(),
-            ),
+        let result = _tunnel_pingpong_netns_with_timeout(
+            listener_8080,
+            connector_8080,
+            NetNS::new(Some("net_d".into())),
+            NetNS::new(Some("net_a".into())),
+            buf.clone(),
+            Duration::from_millis(500),
         )
         .await;
 
-        let stats = insts[2].get_global_ctx().get_acl_filter().get_stats();
+        let stats = insts[2].get_core_instance().acl_stats();
         println!("ACL stats after UDP tests: {}", stats);
 
         assert!(
@@ -1936,10 +3441,7 @@ pub async fn acl_rule_test_subnet_proxy(
     .unwrap_err();
 
     // 移除 ACL 规则
-    insts[2]
-        .get_global_ctx()
-        .get_acl_filter()
-        .reload_rules(None);
+    reload_instance_acl(&insts[2], None).await;
 
     // 验证移除 ACL 后，ICMP 可以正常工作
     wait_for_condition(
@@ -1972,6 +3474,23 @@ where
     }
 }
 
+async fn wait_route_cost(inst: &Instance, peer_id: u32, cost: i32, timeout: Duration) {
+    let core = inst.get_core_instance();
+    wait_for_condition(
+        move || {
+            let core = core.clone();
+            async move {
+                core.route_snapshots()
+                    .await
+                    .iter()
+                    .any(|route| route.peer_id == peer_id && route.cost == cost)
+            }
+        },
+        timeout,
+    )
+    .await;
+}
+
 #[rstest::rstest]
 #[tokio::test]
 #[serial_test::serial]
@@ -1980,8 +3499,6 @@ pub async fn p2p_only_test(
     #[values(true, false)] enable_kcp_proxy: bool,
     #[values(true, false)] enable_quic_proxy: bool,
 ) {
-    use crate::peers::tests::wait_route_appear_with_cost;
-
     let insts = init_three_node_ex(
         "udp",
         |cfg| {
@@ -2004,18 +3521,8 @@ pub async fn p2p_only_test(
     .await;
 
     if has_p2p_conn {
-        insts[2]
-            .get_conn_manager()
-            .add_connector(RingTunnelConnector::new(
-                format!("ring://{}", insts[0].id()).parse().unwrap(),
-            ));
-        wait_route_appear_with_cost(
-            insts[2].get_peer_manager(),
-            insts[0].get_peer_manager().my_peer_id(),
-            Some(1),
-        )
-        .await
-        .unwrap();
+        insts[2].add_connector_url(insts[0].ring_listener_url());
+        wait_route_cost(&insts[2], insts[0].peer_id(), 1, Duration::from_secs(5)).await;
     }
 
     let target_ip = "10.1.2.4";
@@ -2023,7 +3530,7 @@ pub async fn p2p_only_test(
     for target_ip in ["10.144.144.3", target_ip] {
         assert_panics_ext(
             || async {
-                subnet_proxy_test_icmp(target_ip).await;
+                subnet_proxy_test_icmp(target_ip, Duration::from_millis(100)).await;
             },
             !has_p2p_conn,
         )
@@ -2036,7 +3543,7 @@ pub async fn p2p_only_test(
         };
         assert_panics_ext(
             || async {
-                subnet_proxy_test_tcp(listen_ip, target_ip).await;
+                subnet_proxy_test_tcp(listen_ip, target_ip, Duration::from_millis(100)).await;
             },
             !has_p2p_conn,
         )
@@ -2044,7 +3551,7 @@ pub async fn p2p_only_test(
 
         assert_panics_ext(
             || async {
-                subnet_proxy_test_udp(listen_ip, target_ip).await;
+                subnet_proxy_test_udp(listen_ip, target_ip, Duration::from_millis(100)).await;
             },
             !has_p2p_conn,
         )
@@ -2060,12 +3567,7 @@ pub async fn acl_group_base_test(
     #[values(true, false)] enable_kcp_proxy: bool,
     #[values(true, false)] enable_quic_proxy: bool,
 ) {
-    use crate::tunnel::{
-        common::tests::_tunnel_pingpong_netns_with_timeout,
-        tcp::{TcpTunnelConnector, TcpTunnelListener},
-        udp::{UdpTunnelConnector, UdpTunnelListener},
-        TunnelConnector, TunnelListener,
-    };
+    use crate::tunnel::common::tests::_tunnel_pingpong_netns_with_timeout;
     use rand::Rng;
 
     // 构造 ACL 配置，包含组信息
@@ -2177,24 +3679,24 @@ pub async fn acl_group_base_test(
 
     println!("Testing group-based ACL rules...");
 
-    let make_listener = |port: u16| -> Box<dyn TunnelListener + Send + Sync + 'static> {
+    let make_listener = |port: u16| -> Box<dyn SocketListener<Accepted = Box<dyn Tunnel>> + Sync> {
         match protocol {
-            "tcp" => Box::new(TcpTunnelListener::new(
+            "tcp" => Box::new(core_tcp_listener(
                 format!("tcp://0.0.0.0:{}", port).parse().unwrap(),
             )),
-            "udp" => Box::new(UdpTunnelListener::new(
+            "udp" => Box::new(core_udp_listener(
                 format!("udp://0.0.0.0:{}", port).parse().unwrap(),
             )),
             _ => panic!("unsupported protocol: {}", protocol),
         }
     };
 
-    let make_connector = |port: u16| -> Box<dyn TunnelConnector + Send + Sync + 'static> {
+    let make_connector = |port: u16| -> Box<dyn TunnelDialer> {
         match protocol {
-            "tcp" => Box::new(TcpTunnelConnector::new(
+            "tcp" => Box::new(core_tcp_dialer(
                 format!("tcp://10.144.144.3:{}", port).parse().unwrap(),
             )),
-            "udp" => Box::new(UdpTunnelConnector::new(
+            "udp" => Box::new(core_udp_dialer(
                 format!("udp://10.144.144.3:{}", port).parse().unwrap(),
             )),
             _ => panic!("unsupported protocol: {}", protocol),
@@ -2285,10 +3787,201 @@ pub async fn acl_group_base_test(
         protocol
     );
 
-    let stats = insts[2].get_global_ctx().get_acl_filter().get_stats();
+    let stats = insts[2].get_core_instance().acl_stats();
     println!("ACL stats after group {} tests: {:?}", protocol, stats);
 
     println!("✓ All group-based ACL tests completed successfully");
+
+    drop_insts(insts).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+pub async fn lazy_p2p_builds_direct_connection_on_demand() {
+    let insts = init_lazy_p2p_three_node_ex("udp", |cfg| {
+        if cfg.get_inst_name() == "inst1" {
+            let mut flags = cfg.get_flags();
+            flags.lazy_p2p = true;
+            cfg.set_flags(flags);
+        }
+        cfg
+    })
+    .await;
+
+    let inst3_peer_id = insts[2].peer_id();
+    assert!(
+        !insts[0]
+            .get_core_instance()
+            .connected_peers()
+            .await
+            .contains(&inst3_peer_id),
+        "inst1 should not proactively connect to inst3 when lazy_p2p is enabled"
+    );
+    wait_route_cost(&insts[0], inst3_peer_id, 2, Duration::from_secs(5)).await;
+
+    assert!(
+        ping_test("net_a", "10.144.144.3", None).await,
+        "initial relay traffic should still succeed"
+    );
+
+    wait_for_condition(
+        || async {
+            insts[0]
+                .get_core_instance()
+                .connected_peers()
+                .await
+                .contains(&inst3_peer_id)
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+    wait_route_cost(&insts[0], inst3_peer_id, 1, Duration::from_secs(10)).await;
+
+    drop_insts(insts).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+pub async fn need_p2p_overrides_lazy_p2p() {
+    let insts = init_lazy_p2p_three_node_ex("udp", |cfg| {
+        let mut flags = cfg.get_flags();
+        if cfg.get_inst_name() == "inst1" {
+            flags.lazy_p2p = true;
+        }
+        if cfg.get_inst_name() == "inst3" {
+            flags.need_p2p = true;
+        }
+        cfg.set_flags(flags);
+        cfg
+    })
+    .await;
+
+    let inst3_peer_id = insts[2].peer_id();
+    wait_route_cost(&insts[0], inst3_peer_id, 2, Duration::from_secs(5)).await;
+    wait_for_condition(
+        || async {
+            insts[0]
+                .get_core_instance()
+                .connected_peers()
+                .await
+                .contains(&inst3_peer_id)
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+    wait_route_cost(&insts[0], inst3_peer_id, 1, Duration::from_secs(10)).await;
+
+    drop_insts(insts).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+pub async fn disable_p2p_still_connects_to_need_p2p_peers() {
+    let insts = init_lazy_p2p_three_node_ex("udp", |cfg| {
+        let mut flags = cfg.get_flags();
+        if cfg.get_inst_name() == "inst1" {
+            flags.disable_p2p = true;
+        }
+        if cfg.get_inst_name() == "inst3" {
+            flags.need_p2p = true;
+        }
+        cfg.set_flags(flags);
+        cfg
+    })
+    .await;
+
+    let inst3_peer_id = insts[2].peer_id();
+    wait_route_cost(&insts[0], inst3_peer_id, 2, Duration::from_secs(5)).await;
+    wait_for_condition(
+        || async {
+            insts[0]
+                .get_core_instance()
+                .connected_peers()
+                .await
+                .contains(&inst3_peer_id)
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+    wait_route_cost(&insts[0], inst3_peer_id, 1, Duration::from_secs(10)).await;
+
+    drop_insts(insts).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+pub async fn ordinary_nodes_do_not_proactively_connect_to_disable_p2p_peers() {
+    let insts = init_lazy_p2p_three_node_ex("udp", |cfg| {
+        if cfg.get_inst_name() == "inst3" {
+            let mut flags = cfg.get_flags();
+            flags.disable_p2p = true;
+            cfg.set_flags(flags);
+        }
+        cfg
+    })
+    .await;
+
+    let inst3_peer_id = insts[2].peer_id();
+    wait_route_cost(&insts[0], inst3_peer_id, 2, Duration::from_secs(5)).await;
+    assert!(
+        ping_test("net_a", "10.144.144.3", None).await,
+        "relay traffic to disable-p2p peers should still succeed"
+    );
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    assert!(
+        !insts[0]
+            .get_core_instance()
+            .connected_peers()
+            .await
+            .contains(&inst3_peer_id),
+        "ordinary nodes should not proactively establish p2p with disable-p2p peers"
+    );
+    wait_route_cost(&insts[0], inst3_peer_id, 2, Duration::from_secs(3)).await;
+
+    drop_insts(insts).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+pub async fn lazy_p2p_warms_up_before_p2p_only_send() {
+    let insts = init_lazy_p2p_three_node_ex("udp", |cfg| {
+        if cfg.get_inst_name() == "inst1" {
+            let mut flags = cfg.get_flags();
+            flags.lazy_p2p = true;
+            flags.p2p_only = true;
+            cfg.set_flags(flags);
+        }
+        cfg
+    })
+    .await;
+
+    let inst3_peer_id = insts[2].peer_id();
+    wait_route_cost(&insts[0], inst3_peer_id, 2, Duration::from_secs(5)).await;
+    assert!(
+        !ping_test("net_a", "10.144.144.3", None).await,
+        "the first send should still fail under p2p_only before direct connectivity exists"
+    );
+
+    wait_for_condition(
+        || async {
+            insts[0]
+                .get_core_instance()
+                .connected_peers()
+                .await
+                .contains(&inst3_peer_id)
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+    wait_route_cost(&insts[0], inst3_peer_id, 1, Duration::from_secs(10)).await;
+
+    wait_for_condition(
+        || async { ping_test("net_a", "10.144.144.3", None).await },
+        Duration::from_secs(6),
+    )
+    .await;
 
     drop_insts(insts).await;
 }
@@ -2301,12 +3994,7 @@ pub async fn acl_group_self_test(
     #[values(true, false)] enable_kcp_proxy: bool,
     #[values(true, false)] enable_quic_proxy: bool,
 ) {
-    use crate::tunnel::{
-        common::tests::_tunnel_pingpong_netns_with_timeout,
-        tcp::{TcpTunnelConnector, TcpTunnelListener},
-        udp::{UdpTunnelConnector, UdpTunnelListener},
-        TunnelConnector, TunnelListener,
-    };
+    use crate::tunnel::common::tests::_tunnel_pingpong_netns_with_timeout;
     use rand::Rng;
 
     // 构造 ACL 配置，包含组信息
@@ -2389,24 +4077,24 @@ pub async fn acl_group_self_test(
 
     println!("Testing group-based ACL rules...");
 
-    let make_listener = |port: u16| -> Box<dyn TunnelListener + Send + Sync + 'static> {
+    let make_listener = |port: u16| -> Box<dyn SocketListener<Accepted = Box<dyn Tunnel>> + Sync> {
         match protocol {
-            "tcp" => Box::new(TcpTunnelListener::new(
+            "tcp" => Box::new(core_tcp_listener(
                 format!("tcp://0.0.0.0:{}", port).parse().unwrap(),
             )),
-            "udp" => Box::new(UdpTunnelListener::new(
+            "udp" => Box::new(core_udp_listener(
                 format!("udp://0.0.0.0:{}", port).parse().unwrap(),
             )),
             _ => panic!("unsupported protocol: {}", protocol),
         }
     };
 
-    let make_connector = |port: u16| -> Box<dyn TunnelConnector + Send + Sync + 'static> {
+    let make_connector = |port: u16| -> Box<dyn TunnelDialer> {
         match protocol {
-            "tcp" => Box::new(TcpTunnelConnector::new(
+            "tcp" => Box::new(core_tcp_dialer(
                 format!("tcp://10.144.144.3:{}", port).parse().unwrap(),
             )),
-            "udp" => Box::new(UdpTunnelConnector::new(
+            "udp" => Box::new(core_udp_dialer(
                 format!("udp://10.144.144.3:{}", port).parse().unwrap(),
             )),
             _ => panic!("unsupported protocol: {}", protocol),
@@ -2457,10 +4145,111 @@ pub async fn acl_group_self_test(
         protocol
     );
 
-    let stats = insts[2].get_global_ctx().get_acl_filter().get_stats();
+    let stats = insts[2].get_core_instance().acl_stats();
     println!("ACL stats after group {} tests: {:?}", protocol, stats);
 
     println!("✓ All group-based ACL tests completed successfully");
+
+    drop_insts(insts).await;
+}
+
+#[rstest::rstest]
+#[tokio::test]
+#[serial_test::serial]
+pub async fn whitelist_test(
+    #[values("tcp", "udp")] protocol: &str,
+    #[values(true, false)] test_outbound_allow_list: bool,
+) {
+    let port = 44553;
+    let acl_configured_inst = if test_outbound_allow_list {
+        "inst1"
+    } else {
+        "inst3"
+    };
+    let insts = init_three_node_ex(
+        protocol,
+        move |cfg| {
+            let port = if test_outbound_allow_list { 0 } else { port };
+            if cfg.get_inst_name() == acl_configured_inst {
+                if protocol == "tcp" {
+                    cfg.set_tcp_whitelist(vec![format!("{}", port)]);
+                } else if protocol == "udp" {
+                    cfg.set_udp_whitelist(vec![format!("{}", port)]);
+                }
+            }
+            cfg
+        },
+        false,
+    )
+    .await;
+
+    use crate::tunnel::common::tests::_tunnel_pingpong_netns_with_timeout;
+    use rand::Rng;
+
+    let make_listener =
+        |protocol: &str, port: u16| -> Box<dyn SocketListener<Accepted = Box<dyn Tunnel>> + Sync> {
+            match protocol {
+                "tcp" => Box::new(core_tcp_listener(
+                    format!("tcp://0.0.0.0:{}", port).parse().unwrap(),
+                )),
+                "udp" => Box::new(core_udp_listener(
+                    format!("udp://0.0.0.0:{}", port).parse().unwrap(),
+                )),
+                _ => panic!("unsupported protocol: {}", protocol),
+            }
+        };
+
+    let make_connector = |protocol: &str, port: u16| -> Box<dyn TunnelDialer> {
+        match protocol {
+            "tcp" => Box::new(core_tcp_dialer(
+                format!("tcp://10.144.144.3:{}", port).parse().unwrap(),
+            )),
+            "udp" => Box::new(core_udp_dialer(
+                format!("udp://10.144.144.3:{}", port).parse().unwrap(),
+            )),
+            _ => panic!("unsupported protocol: {}", protocol),
+        }
+    };
+
+    let mut buf = vec![0; 32];
+    rand::thread_rng().fill(&mut buf[..]);
+
+    for p in &["tcp", "udp"] {
+        _tunnel_pingpong_netns_with_timeout(
+            make_listener(p, port),
+            make_connector(p, port),
+            NetNS::new(Some("net_c".into())),
+            NetNS::new(Some("net_a".into())),
+            buf.clone(),
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{} should be allowed", p));
+    }
+
+    if test_outbound_allow_list {
+        return;
+    }
+
+    // test other port
+    let other_port = port + 1;
+    for p in ["tcp", "udp"] {
+        let r = _tunnel_pingpong_netns_with_timeout(
+            make_listener(p, other_port),
+            make_connector(p, other_port),
+            NetNS::new(Some("net_c".into())),
+            NetNS::new(Some("net_a".into())),
+            buf.clone(),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+
+        if p != protocol {
+            assert!(r.is_ok(), "{} should be allowed", p);
+        } else {
+            assert!(r.is_err(), "{} should be blocked", p);
+        }
+    }
 
     drop_insts(insts).await;
 }
@@ -2477,18 +4266,26 @@ pub async fn config_patch_test() {
     };
     use crate::tunnel::common::tests::_tunnel_pingpong_netns_with_timeout;
 
-    let insts = init_three_node("udp").await;
+    let insts = init_three_node_ex(
+        "udp",
+        |cfg| {
+            cfg.set_ipv6(None);
+            cfg
+        },
+        false,
+    )
+    .await;
 
     check_route(
         "10.144.144.2/24",
         insts[1].peer_id(),
-        insts[0].get_peer_manager().list_routes().await,
+        insts[0].get_core_instance().route_snapshots().await,
     );
 
     check_route(
         "10.144.144.3/24",
         insts[2].peer_id(),
-        insts[0].get_peer_manager().list_routes().await,
+        insts[0].get_core_instance().route_snapshots().await,
     );
 
     // 测试1： 修改hostname、ip、子网代理
@@ -2514,7 +4311,7 @@ pub async fn config_patch_test() {
     );
     tokio::time::sleep(Duration::from_secs(1)).await;
     check_route_ex(
-        insts[0].get_peer_manager().list_routes().await,
+        insts[0].get_core_instance().route_snapshots().await,
         insts[1].peer_id(),
         |r| {
             assert_eq!(r.hostname, "new_inst1");
@@ -2522,6 +4319,69 @@ pub async fn config_patch_test() {
             assert_eq!(r.proxy_cidrs[0], "10.144.145.0/24");
             true
         },
+    );
+    let patch = InstanceConfigPatch {
+        proxy_networks: vec![ProxyNetworkPatch {
+            action: ConfigPatchAction::Clear as i32,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    insts[1]
+        .get_config_patcher()
+        .apply_patch(patch)
+        .await
+        .unwrap();
+    assert!(
+        insts[1]
+            .get_global_ctx()
+            .config
+            .get_proxy_cidrs()
+            .is_empty()
+    );
+
+    // 测试1.1：修改公网 IPv6 provider 相关配置
+    let public_prefix = "2001:db8:100::/64";
+    let patch = InstanceConfigPatch {
+        ipv6_public_addr_provider: Some(true),
+        ipv6_public_addr_auto: Some(true),
+        ipv6_public_addr_prefix: Some(public_prefix.to_string()),
+        ..Default::default()
+    };
+    insts[1]
+        .get_config_patcher()
+        .apply_patch(patch)
+        .await
+        .unwrap();
+    assert!(
+        insts[1]
+            .get_global_ctx()
+            .config
+            .get_ipv6_public_addr_provider()
+    );
+    assert!(insts[1].get_global_ctx().config.get_ipv6_public_addr_auto());
+    assert_eq!(
+        insts[1]
+            .get_global_ctx()
+            .config
+            .get_ipv6_public_addr_prefix(),
+        Some(public_prefix.parse().unwrap())
+    );
+    assert!(
+        insts[1]
+            .get_core_instance()
+            .node_snapshot()
+            .await
+            .feature_flags
+            .ipv6_public_addr_provider
+    );
+    assert_eq!(
+        insts[1]
+            .get_core_instance()
+            .node_snapshot()
+            .await
+            .ipv6_public_addr_prefix,
+        Some(public_prefix.parse().unwrap())
     );
 
     // 测试2: 端口转发
@@ -2544,8 +4404,8 @@ pub async fn config_patch_test() {
 
     let mut buf = vec![0; 32];
     rand::thread_rng().fill(&mut buf[..]);
-    let tcp_listener = TcpTunnelListener::new("tcp://0.0.0.0:23457".parse().unwrap());
-    let tcp_connector = TcpTunnelConnector::new("tcp://127.0.0.1:23458".parse().unwrap());
+    let tcp_listener = core_tcp_listener("tcp://0.0.0.0:23457".parse().unwrap());
+    let tcp_connector = core_tcp_dialer("tcp://127.0.0.1:23458".parse().unwrap());
     let result = _tunnel_pingpong_netns_with_timeout(
         tcp_listener,
         tcp_connector,
@@ -2557,5 +4417,465 @@ pub async fn config_patch_test() {
     .await;
     assert!(result.is_ok(), "Port forward pingpong should succeed");
 
+    drop_insts(insts).await;
+}
+
+#[rstest::rstest]
+#[tokio::test]
+#[serial_test::serial]
+pub async fn config_patch_disable_relay_data_test() {
+    use crate::proto::api::config::InstanceConfigPatch;
+
+    let insts = init_three_node_ex(
+        "udp",
+        |cfg| {
+            cfg.set_ipv6(None);
+            cfg
+        },
+        false,
+    )
+    .await;
+
+    let relay_peer_id = insts[1].peer_id();
+    let dst_peer_id = insts[2].peer_id();
+    assert!(!insts[1].get_global_ctx().get_flags().disable_relay_data);
+    assert!(
+        !insts[1]
+            .get_core_instance()
+            .node_snapshot()
+            .await
+            .feature_flags
+            .avoid_relay_data
+    );
+
+    check_route_ex(
+        insts[0].get_core_instance().route_snapshots().await,
+        dst_peer_id,
+        |route| {
+            assert_eq!(route.next_hop_peer_id, relay_peer_id);
+            true
+        },
+    );
+
+    wait_for_condition(
+        || async { ping_test("net_a", "10.144.144.3", None).await },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    insts[1]
+        .get_config_patcher()
+        .apply_patch(InstanceConfigPatch {
+            disable_relay_data: Some(true),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    assert!(insts[1].get_global_ctx().get_flags().disable_relay_data);
+    assert!(
+        insts[1]
+            .get_global_ctx()
+            .config
+            .get_flags()
+            .disable_relay_data
+    );
+    assert!(
+        insts[1]
+            .get_core_instance()
+            .node_snapshot()
+            .await
+            .feature_flags
+            .avoid_relay_data
+    );
+
+    wait_for_condition(
+        || {
+            let core = insts[0].get_core_instance();
+            async move {
+                core.route_snapshots().await.iter().any(|route| {
+                    route.peer_id == relay_peer_id
+                        && route
+                            .feature_flag
+                            .as_ref()
+                            .map(|flag| flag.avoid_relay_data)
+                            .unwrap_or(false)
+                })
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    check_route_ex(
+        insts[0].get_core_instance().route_snapshots().await,
+        dst_peer_id,
+        |route| {
+            assert_eq!(route.next_hop_peer_id, relay_peer_id);
+            true
+        },
+    );
+    assert!(
+        !ping_test("net_a", "10.144.144.3", None).await,
+        "traffic from inst1 to inst3 should be blocked while inst2 relay data is disabled"
+    );
+
+    insts[1]
+        .get_config_patcher()
+        .apply_patch(InstanceConfigPatch {
+            disable_relay_data: Some(false),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    assert!(!insts[1].get_global_ctx().get_flags().disable_relay_data);
+    assert!(
+        !insts[1]
+            .get_global_ctx()
+            .config
+            .get_flags()
+            .disable_relay_data
+    );
+    assert!(
+        !insts[1]
+            .get_core_instance()
+            .node_snapshot()
+            .await
+            .feature_flags
+            .avoid_relay_data
+    );
+
+    wait_for_condition(
+        || {
+            let core = insts[0].get_core_instance();
+            async move {
+                core.route_snapshots().await.iter().any(|route| {
+                    route.peer_id == relay_peer_id
+                        && route
+                            .feature_flag
+                            .as_ref()
+                            .map(|flag| !flag.avoid_relay_data)
+                            .unwrap_or(false)
+                })
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    wait_for_condition(
+        || async { ping_test("net_a", "10.144.144.3", None).await },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    drop_insts(insts).await;
+}
+
+/// Generate SecureModeConfig with specified x25519 private key
+pub fn generate_secure_mode_config_with_key(
+    private_key: &x25519_dalek::StaticSecret,
+) -> SecureModeConfig {
+    use base64::{Engine, prelude::BASE64_STANDARD};
+    use x25519_dalek::PublicKey;
+
+    let public = PublicKey::from(private_key);
+
+    SecureModeConfig {
+        enabled: true,
+        local_private_key: Some(BASE64_STANDARD.encode(private_key.as_bytes())),
+        local_public_key: Some(BASE64_STANDARD.encode(public.as_bytes())),
+    }
+}
+
+/// Generate SecureModeConfig with random x25519 keypair
+pub fn generate_secure_mode_config() -> SecureModeConfig {
+    let private = StaticSecret::random_from_rng(OsRng);
+    generate_secure_mode_config_with_key(&private)
+}
+
+/// Test relay peer end-to-end encryption with TCP
+#[rstest::rstest]
+#[tokio::test]
+#[serial_test::serial]
+pub async fn relay_peer_e2e_encryption(#[values("tcp", "udp")] proto: &str) {
+    let insts = init_three_node_ex(
+        proto,
+        |cfg| {
+            cfg.set_secure_mode(Some(generate_secure_mode_config()));
+            cfg
+        },
+        false,
+    )
+    .await;
+
+    let inst1_peer_id = insts[0].peer_id();
+    let inst2_peer_id = insts[1].peer_id();
+    let inst3_peer_id = insts[2].peer_id();
+
+    println!(
+        "Test topology: inst1({}) <-> inst2({}) <-> inst3({})",
+        inst1_peer_id, inst2_peer_id, inst3_peer_id
+    );
+
+    // Check secure mode is enabled
+    let secure_mode_1 = insts[0].get_global_ctx().config.get_secure_mode();
+    let secure_mode_2 = insts[1].get_global_ctx().config.get_secure_mode();
+    let secure_mode_3 = insts[2].get_global_ctx().config.get_secure_mode();
+    println!(
+        "Secure mode enabled: inst1={}, inst2={}, inst3={}",
+        secure_mode_1.is_some(),
+        secure_mode_2.is_some(),
+        secure_mode_3.is_some()
+    );
+
+    // Wait for routes to be established
+    wait_for_condition(
+        || async {
+            let routes = insts[0].get_core_instance().route_snapshots().await;
+            routes.len() == 2
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    // Verify inst1 sees inst3 via inst2 (non-direct path)
+    let next_hop_to_inst3 = insts[0]
+        .get_core_instance()
+        .route_snapshots()
+        .await
+        .into_iter()
+        .find(|route| route.peer_id == inst3_peer_id)
+        .map(|route| route.next_hop_peer_id);
+    println!("Next hop from inst1 to inst3: {:?}", next_hop_to_inst3);
+    assert_eq!(
+        next_hop_to_inst3,
+        Some(inst2_peer_id),
+        "inst1 should reach inst3 via inst2 (relay)"
+    );
+
+    // Verify inst1 has no direct connection to inst3
+    assert!(
+        !insts[0]
+            .get_core_instance()
+            .connected_peers()
+            .await
+            .contains(&inst3_peer_id),
+        "inst1 should NOT have direct connection to inst3"
+    );
+
+    // Check if noise_static_pubkey is available for relay handshake
+    let route_has_static_key = insts[0]
+        .get_core_instance()
+        .relay_route_has_static_key_for_test(inst3_peer_id)
+        .await;
+    println!(
+        "Route info for inst3 on inst1 has a relay static key: {}",
+        route_has_static_key
+    );
+
+    // Wait until relay route info includes inst3 static pubkey for IK handshake.
+    wait_for_condition(
+        || async {
+            insts[0]
+                .get_core_instance()
+                .relay_route_has_static_key_for_test(inst3_peer_id)
+                .await
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    // Test basic connectivity through relay
+    println!("Starting ping test from net_a to 10.144.144.3...");
+
+    assert!(
+        ping_test("net_a", "10.144.144.3", None).await,
+        "Ping from net_a to inst3 should succeed"
+    );
+
+    // Verify relay sessions are established
+    let relay_1 = insts[0]
+        .get_core_instance()
+        .relay_session_snapshot_for_test(inst3_peer_id);
+    let relay_3 = insts[2]
+        .get_core_instance()
+        .relay_session_snapshot_for_test(inst1_peer_id);
+
+    println!(
+        "Relay states after ping: inst1->inst3: {}, inst3->inst1: {}",
+        relay_1.has_state, relay_3.has_state
+    );
+
+    // Test bidirectional connectivity
+    assert!(
+        ping_test("net_a", "10.144.144.3", None).await,
+        "Ping from net_a to inst3 should work"
+    );
+    assert!(
+        ping_test("net_c", "10.144.144.1", None).await,
+        "Ping from net_c to inst1 should work"
+    );
+
+    println!("Test completed successfully!");
+    drop_insts(insts).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+pub async fn relay_peer_e2e_encryption_udp() {
+    let insts = init_three_node_ex(
+        "udp",
+        |cfg| {
+            cfg.set_secure_mode(Some(generate_secure_mode_config()));
+            cfg
+        },
+        false,
+    )
+    .await;
+
+    let inst1_id = insts[0].get_global_ctx().get_id().to_string();
+    let inst3_id = insts[2].get_global_ctx().get_id().to_string();
+    let network_name = insts[0].get_global_ctx().get_network_name();
+    let total_labels =
+        LabelSet::new().with_label_type(LabelType::NetworkName(network_name.clone()));
+
+    wait_for_condition(
+        || async {
+            let routes = insts[0].get_core_instance().route_snapshots().await;
+            routes.len() == 2
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    wait_for_condition(
+        || async { ping_test("net_a", "10.144.144.3", None).await },
+        Duration::from_secs(6),
+    )
+    .await;
+
+    let tx_labels = LabelSet::new()
+        .with_label_type(LabelType::NetworkName(network_name.clone()))
+        .with_label_type(LabelType::ToInstanceId(inst3_id.clone()));
+    let rx_labels = LabelSet::new()
+        .with_label_type(LabelType::NetworkName(network_name.clone()))
+        .with_label_type(LabelType::FromInstanceId(inst1_id.clone()));
+
+    wait_for_condition(
+        || async {
+            let metrics = insts[0].get_core_instance().metric_snapshots();
+            metric_value(&metrics, MetricName::TrafficBytesTx, &tx_labels).is_none()
+                && metric_value(&metrics, MetricName::TrafficPacketsTx, &tx_labels).is_none()
+                && metric_value(&metrics, MetricName::TrafficBytesTx, &total_labels)
+                    .is_some_and(|value| value > 0)
+                && metric_value(&metrics, MetricName::TrafficPacketsTx, &total_labels)
+                    .is_some_and(|value| value > 0)
+                && metric_value(&metrics, MetricName::TrafficBytesTxByInstance, &tx_labels)
+                    .is_some_and(|value| value > 0)
+                && metric_value(&metrics, MetricName::TrafficPacketsTxByInstance, &tx_labels)
+                    .is_some_and(|value| value > 0)
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    wait_for_condition(
+        || async {
+            let metrics = insts[2].get_core_instance().metric_snapshots();
+            metric_value(&metrics, MetricName::TrafficBytesRx, &rx_labels).is_none()
+                && metric_value(&metrics, MetricName::TrafficPacketsRx, &rx_labels).is_none()
+                && metric_value(&metrics, MetricName::TrafficBytesRx, &total_labels)
+                    .is_some_and(|value| value > 0)
+                && metric_value(&metrics, MetricName::TrafficPacketsRx, &total_labels)
+                    .is_some_and(|value| value > 0)
+                && metric_value(&metrics, MetricName::TrafficBytesRxByInstance, &rx_labels)
+                    .is_some_and(|value| value > 0)
+                && metric_value(&metrics, MetricName::TrafficPacketsRxByInstance, &rx_labels)
+                    .is_some_and(|value| value > 0)
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    drop_insts(insts).await;
+}
+
+/// Test Relay Peer session cleanup on relay failure - TCP
+#[tokio::test]
+#[serial_test::serial]
+pub async fn relay_peer_session_cleanup() {
+    let mut insts = init_three_node_ex(
+        "tcp",
+        |cfg| {
+            cfg.set_secure_mode(Some(generate_secure_mode_config()));
+            cfg
+        },
+        false,
+    )
+    .await;
+
+    let inst2_peer_id = insts[1].peer_id();
+    let inst3_peer_id = insts[2].peer_id();
+    let core_1 = insts[0].get_core_instance();
+
+    wait_for_condition(
+        || async { ping_test("net_a", "10.144.144.3", None).await },
+        Duration::from_secs(6),
+    )
+    .await;
+
+    wait_for_condition(
+        || async {
+            let relay = core_1.relay_session_snapshot_for_test(inst3_peer_id);
+            relay.has_state && relay.has_session
+        },
+        Duration::from_secs(3),
+    )
+    .await;
+
+    let next_hop = insts[0]
+        .get_core_instance()
+        .route_snapshots()
+        .await
+        .into_iter()
+        .find(|route| route.peer_id == inst3_peer_id)
+        .map(|route| route.next_hop_peer_id);
+    assert_eq!(next_hop, Some(inst2_peer_id));
+
+    let mut inst2 = insts.remove(1);
+    inst2.clear_resources().await;
+    drop(inst2);
+
+    wait_for_condition(
+        || async {
+            let routes = insts[0].get_core_instance().route_snapshots().await;
+            !routes.iter().any(|r| r.peer_id == inst3_peer_id)
+        },
+        Duration::from_secs(6),
+    )
+    .await;
+
+    core_1.evict_idle_relay_sessions_for_test(Duration::from_millis(0));
+    assert!(
+        !core_1
+            .relay_session_snapshot_for_test(inst3_peer_id)
+            .has_state
+    );
+
+    core_1.evict_unused_peer_sessions_for_test(Duration::from_millis(0));
+
+    wait_for_condition(
+        || async {
+            !core_1
+                .relay_session_snapshot_for_test(inst3_peer_id)
+                .has_session
+        },
+        Duration::from_secs(1),
+    )
+    .await;
+
+    drop(core_1);
     drop_insts(insts).await;
 }

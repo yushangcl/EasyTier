@@ -4,11 +4,14 @@ use std::path::PathBuf;
 
 use service_manager::ServiceManager as _;
 
+use crate::common::log;
+
 #[derive(Debug)]
 pub struct ServiceInstallOptions {
     pub program: PathBuf,
     pub args: Vec<OsString>,
     pub work_directory: PathBuf,
+    pub environment: Option<Vec<(String, String)>>,
     pub disable_autostart: bool,
     pub description: Option<String>,
     pub display_name: Option<String>,
@@ -49,7 +52,7 @@ impl Service {
     pub fn new(name: String) -> Result<Self, anyhow::Error> {
         #[cfg(target_os = "windows")]
         let service_manager = Box::new(self::win_service_manager::WinServiceManager::new()?);
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", not(feature = "macos-ne")))]
         let service_manager: Box<dyn ServiceManager> =
             Box::new(service_manager::TypedServiceManager::Launchd(
                 service_manager::LaunchdServiceManager::system().with_config(
@@ -63,13 +66,16 @@ impl Service {
                 ),
             ));
 
-        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        #[cfg(not(any(
+            target_os = "windows",
+            all(target_os = "macos", not(feature = "macos-ne"))
+        )))]
         let service_manager: Box<dyn ServiceManager> =
             Box::new(service_manager::TypedServiceManager::native()?);
 
         let kind = service_manager::ServiceManagerKind::native()?;
 
-        println!("service manager kind: {:?}", kind);
+        log::info!("service manager kind: {:?}", kind);
 
         Ok(Self {
             label: name.parse()?,
@@ -87,7 +93,7 @@ impl Service {
             autostart: !options.disable_autostart,
             username: None,
             working_directory: Some(options.work_directory.clone()),
-            environment: None,
+            environment: options.environment.clone(),
             disable_restart_on_failure: options.disable_restart_on_failure,
         };
 
@@ -95,15 +101,15 @@ impl Service {
             self.service_manager
                 .update(ctx)
                 .map_err(|e| anyhow::anyhow!("failed to update service: {:?}", e))?;
-            println!("Service updated successfully! Service Name: {}", self.label);
+            log::info!("Service updated successfully! Service Name: {}", self.label);
             return Ok(());
         }
 
         self.service_manager
-            .install(ctx.clone())
+            .install(ctx)
             .map_err(|e| anyhow::anyhow!("failed to install service: {:?}", e))?;
 
-        println!(
+        log::info!(
             "Service installed successfully! Service Name: {}",
             self.label
         );
@@ -346,7 +352,7 @@ mod win_service_manager {
         ServiceStopCtx, ServiceUninstallCtx,
     };
 
-    use winreg::{enums::*, RegKey};
+    use winreg::{RegKey, enums::*};
 
     use crate::common::constants::WIN_SERVICE_WORK_DIR_REG_KEY;
 
@@ -486,10 +492,10 @@ mod win_service_manager {
             {
                 Ok(s) => s,
                 Err(e) => {
-                    if let windows_service::Error::Winapi(ref win_err) = e {
-                        if win_err.raw_os_error() == Some(0x424) {
-                            return Ok(ServiceStatus::NotInstalled);
-                        }
+                    if let windows_service::Error::Winapi(ref win_err) = e
+                        && win_err.raw_os_error() == Some(0x424)
+                    {
+                        return Ok(ServiceStatus::NotInstalled);
                     }
                     return Err(io::Error::other(e));
                 }

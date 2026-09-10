@@ -4,8 +4,12 @@ export interface WebClientConfig {
     config_server_url?: string
 }
 
-interface NormalMode extends WebClientConfig {
+export interface NormalMode extends WebClientConfig {
     mode: 'normal'
+    // if not provided will use ring tunnel rpc server
+    rpc_portal?: string
+    enable_rpc_port_listen?: boolean
+    rpc_listen_port?: number
 }
 
 export interface ServiceMode extends WebClientConfig {
@@ -14,6 +18,7 @@ export interface ServiceMode extends WebClientConfig {
     rpc_portal: string
     file_log_level: 'off' | 'warn' | 'info' | 'debug' | 'trace'
     file_log_dir: string
+    installed_core_version?: string
 }
 
 export interface RemoteMode {

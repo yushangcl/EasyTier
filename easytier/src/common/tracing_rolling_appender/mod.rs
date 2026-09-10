@@ -81,16 +81,12 @@ where
     /// Determines the final filename, where n==0 indicates the current file
     fn filename_for(&self, n: usize) -> String {
         let f = self.filename.clone();
-        if n > 0 {
-            format!("{}.{}", f, n)
-        } else {
-            f
-        }
+        if n > 0 { format!("{}.{}", f, n) } else { f }
     }
 
     /// Rotates old files to make room for a new one.
     /// This may result in the deletion of the oldest file
-    fn rotate_files(&mut self) -> io::Result<()> {
+    fn rotate_files(&self) -> io::Result<()> {
         // ignore any failure removing the oldest file (may not exist)
         let _ = fs::remove_file(self.filename_for(self.max_filecount.max(1)));
         let mut r = Ok(());
@@ -145,14 +141,14 @@ where
 
     /// Writes data using the given datetime to calculate the rolling condition
     pub fn write_with_datetime(&mut self, buf: &[u8], now: &DateTime<Local>) -> io::Result<usize> {
-        if self.condition.should_rollover(now, self.current_filesize) {
-            if let Err(e) = self.rollover() {
-                // If we can't rollover, just try to continue writing anyway
-                // (better than missing data).
-                // This will likely used to implement logging, so
-                // avoid using log::warn and log to stderr directly
-                eprintln!("WARNING: Failed to rotate logfile {}: {}", self.filename, e);
-            }
+        if self.condition.should_rollover(now, self.current_filesize)
+            && let Err(e) = self.rollover()
+        {
+            // If we can't rollover, just try to continue writing anyway
+            // (better than missing data).
+            // This will likely used to implement logging, so
+            // avoid using log::warn and log to stderr directly
+            eprintln!("WARNING: Failed to rotate logfile {}: {}", self.filename, e);
         }
         self.open_writer_if_needed()?;
         if let Some(writer) = self.writer_opt.as_mut() {
@@ -184,18 +180,9 @@ where
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct FileAppenderWrapper {
     appender: std::sync::Arc<parking_lot::Mutex<RollingFileAppenderBase>>,
-}
-
-impl tracing_subscriber::fmt::MakeWriter<'_> for FileAppenderWrapper {
-    type Writer = FileAppenderWriter;
-
-    fn make_writer(&self) -> Self::Writer {
-        FileAppenderWriter {
-            appender: self.appender.clone(),
-        }
-    }
 }
 
 impl FileAppenderWrapper {
@@ -204,18 +191,12 @@ impl FileAppenderWrapper {
             appender: std::sync::Arc::new(parking_lot::Mutex::new(appender)),
         }
     }
-}
 
-pub struct FileAppenderWriter {
-    appender: std::sync::Arc<parking_lot::Mutex<RollingFileAppenderBase>>,
-}
-
-impl std::io::Write for FileAppenderWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.appender.lock().write(buf)
+    pub fn write_all(&self, buf: &[u8]) -> std::io::Result<()> {
+        self.appender.lock().write_all(buf)
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
+    pub fn flush(&self) -> std::io::Result<()> {
         self.appender.lock().flush()
     }
 }

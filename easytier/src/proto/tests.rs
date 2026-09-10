@@ -1,11 +1,106 @@
-include!(concat!(env!("OUT_DIR"), "/tests.rs"));
+pub use easytier_proto::tests::*;
 
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt as _;
 use tokio::task::JoinSet;
 
-use super::rpc_impl::RpcController;
+use super::rpc::RpcController;
+
+#[derive(Clone, Default)]
+struct GreetingJsonCallHandler;
+
+#[async_trait::async_trait]
+impl crate::proto::rpc_types::handler::Handler for GreetingJsonCallHandler {
+    type Descriptor = GreetingDescriptor;
+    type Controller = crate::proto::rpc_types::controller::BaseController;
+
+    async fn call(
+        &self,
+        _ctrl: Self::Controller,
+        method: <Self::Descriptor as crate::proto::rpc_types::descriptor::ServiceDescriptor>::Method,
+        input: bytes::Bytes,
+    ) -> crate::proto::rpc_types::error::Result<bytes::Bytes> {
+        use prost::Message;
+        match method {
+            GreetingMethodDescriptor::SayHello => {
+                let req = SayHelloRequest::decode(input)?;
+                let resp = SayHelloResponse {
+                    greeting: format!("Hello {}!", req.name),
+                };
+                Ok(bytes::Bytes::from(resp.encode_to_vec()))
+            }
+            GreetingMethodDescriptor::SayGoodbye => {
+                let req = SayGoodbyeRequest::decode(input)?;
+                let resp = SayGoodbyeResponse {
+                    greeting: format!("Goodbye, {}!", req.name),
+                };
+                Ok(bytes::Bytes::from(resp.encode_to_vec()))
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn greeting_client_json_call_method_supports_snake_and_proto_method_name() {
+    let client = GreetingClient::new(GreetingJsonCallHandler);
+
+    let snake = client
+        .json_call_method(
+            crate::proto::rpc_types::controller::BaseController::default(),
+            "say_hello",
+            serde_json::json!({"name": "world"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(snake["greeting"], serde_json::json!("Hello world!"));
+
+    let proto = client
+        .json_call_method(
+            crate::proto::rpc_types::controller::BaseController::default(),
+            "SayHello",
+            serde_json::json!({"name": "world"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(proto["greeting"], serde_json::json!("Hello world!"));
+}
+
+#[tokio::test]
+async fn greeting_client_json_call_method_rejects_invalid_json() {
+    let client = GreetingClient::new(GreetingJsonCallHandler);
+
+    let err = client
+        .json_call_method(
+            crate::proto::rpc_types::controller::BaseController::default(),
+            "say_hello",
+            serde_json::json!({"name": 123}),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::proto::rpc_types::error::Error::MalformatRpcPacket(_)
+    ));
+}
+
+#[tokio::test]
+async fn greeting_client_json_call_method_rejects_unknown_method() {
+    let client = GreetingClient::new(GreetingJsonCallHandler);
+
+    let err = client
+        .json_call_method(
+            crate::proto::rpc_types::controller::BaseController::default(),
+            "not_exist_method",
+            serde_json::json!({"name": "world"}),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::proto::rpc_types::error::Error::InvalidMethodIndex(0, _)
+    ));
+}
 
 #[derive(Clone)]
 pub struct GreetingService {
@@ -42,13 +137,13 @@ impl Greeting for GreetingService {
 }
 
 use crate::proto::common::{CompressionAlgoPb, RpcCompressionInfo};
-use crate::proto::rpc_impl::client::Client;
-use crate::proto::rpc_impl::server::Server;
+use crate::proto::rpc::client::Client;
+use crate::proto::rpc::server::Server;
 
 struct TestContext {
     client: Client,
     server: Server,
-    tasks: Arc<Mutex<JoinSet<()>>>,
+    _tasks: Arc<Mutex<JoinSet<()>>>,
 }
 
 impl TestContext {
@@ -90,14 +185,14 @@ impl TestContext {
         Self {
             client,
             server: rpc_server,
-            tasks,
+            _tasks: tasks,
         }
     }
 }
 
 fn random_string(len: usize) -> String {
-    use rand::distributions::Alphanumeric;
     use rand::Rng;
+    use rand::distributions::Alphanumeric;
     let mut rng = rand::thread_rng();
     let s: Vec<u8> = std::iter::repeat(())
         .map(|()| rng.sample(Alphanumeric))
@@ -198,7 +293,7 @@ async fn rpc_timeout_test() {
 #[tokio::test]
 async fn rpc_tunnel_stuck_test() {
     use crate::proto::rpc_types;
-    use crate::tunnel::ring::RING_TUNNEL_CAP;
+    use easytier_core::tunnel::ring::RING_TUNNEL_CAP;
 
     let rpc_server = Server::new();
     rpc_server.run();
@@ -277,63 +372,12 @@ async fn rpc_tunnel_stuck_test() {
 }
 
 #[tokio::test]
-async fn standalone_rpc_test() {
-    use crate::proto::rpc_impl::standalone::{StandAloneClient, StandAloneServer};
-    use crate::tunnel::tcp::{TcpTunnelConnector, TcpTunnelListener};
-
-    let mut server = StandAloneServer::new(TcpTunnelListener::new(
-        "tcp://0.0.0.0:33455".parse().unwrap(),
-    ));
-    let service = GreetingServer::new(GreetingService {
-        delay_ms: 0,
-        prefix: "Hello".to_string(),
-    });
-    server.registry().register(service, "test");
-    server.serve().await.unwrap();
-
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    let mut client = StandAloneClient::new(TcpTunnelConnector::new(
-        "tcp://127.0.0.1:33455".parse().unwrap(),
-    ));
-
-    let out = client
-        .scoped_client::<GreetingClientFactory<RpcController>>("test".to_string())
-        .await
-        .unwrap();
-
-    let ctrl = RpcController::default();
-    let input = SayHelloRequest {
-        name: "world".to_string(),
-    };
-    let ret = out.say_hello(ctrl, input).await;
-    assert_eq!(ret.unwrap().greeting, "Hello world!");
-
-    let out = client
-        .scoped_client::<GreetingClientFactory<RpcController>>("test".to_string())
-        .await
-        .unwrap();
-
-    let ctrl = RpcController::default();
-    let input = SayGoodbyeRequest {
-        name: "world".to_string(),
-    };
-    let ret = out.say_goodbye(ctrl, input).await;
-    assert_eq!(ret.unwrap().greeting, "Goodbye, world!");
-
-    drop(client);
-
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    assert_eq!(0, server.inflight_server());
-}
-
-#[tokio::test]
 async fn test_bidirect_rpc_manager() {
-    use crate::common::scoped_task::ScopedTask;
-    use crate::proto::rpc_impl::bidirect::BidirectRpcManager;
-    use crate::tunnel::tcp::{TcpTunnelConnector, TcpTunnelListener};
-    use crate::tunnel::{TunnelConnector, TunnelListener};
+    use crate::proto::rpc::bidirect::BidirectRpcManager;
+    use crate::proto::rpc::standalone::{runtime_rpc_dialer, runtime_rpc_listener};
+    use easytier_core::{connectivity::protocol::raw::TunnelDialer, socket::SocketListener};
     use tokio::sync::Notify;
+    use tokio_util::task::AbortOnDropHandle;
 
     let c = BidirectRpcManager::new();
     let s = BidirectRpcManager::new();
@@ -352,8 +396,8 @@ async fn test_bidirect_rpc_manager() {
 
     let server_test_done = Arc::new(Notify::new());
     let server_test_done_clone = server_test_done.clone();
-    let mut tcp_listener = TcpTunnelListener::new("tcp://0.0.0.0:55443".parse().unwrap());
-    let s_task: ScopedTask<()> = tokio::spawn(async move {
+    let mut tcp_listener = runtime_rpc_listener("0.0.0.0:55443".parse().unwrap());
+    let s_task = AbortOnDropHandle::new(tokio::spawn(async move {
         tcp_listener.listen().await.unwrap();
         let tunnel = tcp_listener.accept().await.unwrap();
         s.run_with_tunnel(tunnel);
@@ -376,12 +420,11 @@ async fn test_bidirect_rpc_manager() {
         server_test_done_clone.notify_one();
 
         s.wait().await;
-    })
-    .into();
+    }));
 
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-    let mut tcp_connector = TcpTunnelConnector::new("tcp://0.0.0.0:55443".parse().unwrap());
+    let tcp_connector = runtime_rpc_dialer("tcp://0.0.0.0:55443".parse().unwrap());
     let c_tunnel = tcp_connector.connect().await.unwrap();
     c.run_with_tunnel(c_tunnel);
 

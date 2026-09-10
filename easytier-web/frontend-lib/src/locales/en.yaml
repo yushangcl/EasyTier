@@ -3,6 +3,14 @@ networking_method: Networking Method
 public_server: Public Server
 manual: Manual
 standalone: Standalone
+initial_nodes: Initial Nodes
+initial_nodes_help: |
+  EasyTier does not distinguish between server and client roles.
+  • Filling in Initial Nodes = plugging in the cable and joining an existing network.
+  • Leaving it empty = the node starts alone until others connect to it, or you connect it later yourself.
+  • Direct or indirect connectivity, including through relay nodes, can form one network.
+  Initial nodes can be your own nodes or ones shared by others.
+initial_node_placeholder: "Example: node.example.com"
 virtual_ipv4: Virtual IPv4
 virtual_ipv4_dhcp: DHCP
 network_name: Network Name
@@ -10,26 +18,61 @@ network_secret: Network Secret
 public_server_url: Public Server URL
 peer_urls: Peer URLs
 proxy_cidrs: Subnet Proxy CIDRs
-enable_vpn_portal: Enable VPN Portal
-vpn_portal_listen_port: VPN Portal Listen Port
-vpn_portal_client_network: Client Sub Network
+vpn_portal_wireguard_listen: WireGuard Listen Address
+vpn_portal_wireguard_listen_placeholder: "Example: 0.0.0.0:22022"
+vpn_portal_wireguard_private_key: WireGuard Server Private Key
+vpn_portal_wireguard_private_key_placeholder: Required base64 key (generate with wg genkey)
+vpn_portal_clients: WireGuard Clients
+vpn_portal_add_client: Add Client
+vpn_portal_no_clients: No clients configured
+vpn_portal_client_name: Client Name
+vpn_portal_client_name_placeholder: "Example: alice-phone"
+vpn_portal_client_virtual_ip: Virtual Network CIDR
+vpn_portal_client_virtual_ip_placeholder: "Example: 10.126.126.10/24"
+vpn_portal_client_groups: ACL Groups
+vpn_portal_client_groups_placeholder: Select ACL groups
+vpn_portal_remove_client: Remove Client
 dev_name: TUN interface name
 advanced_settings: Advanced Settings
 basic_settings: Basic Settings
 listener_urls: Listener URLs
 rpc_port: RPC Port
+port: Port
+path: Path
 rpc_portal_whitelists: RPC Whitelist
 config_network: Config Network
 running: Running
 error_msg: Error Message
 detail: Detail
 add_new_network: New Network
+add_peer_url: Add Peer
+add_initial_node: Add Initial Node
+add_listener_url: Add Listener
+add_mapped_listener: Add Mapped Listener
 del_cur_network: Delete Current Network
 select_network: Select Network
 network_instances: Network Instances
 instance_id: Instance ID
 network_infos: Network Infos
 parse_network_config: Parse Network Config
+config_generator_placeholder: Generated TOML configuration appears here
+generate_config: Generate Config
+copy_config: Copy Config
+config_copied: Copied
+config_generation_failed: Generation failed
+config_copy_failed: Copy failed
+magisk_module_configuration: EasyTier Module Configuration
+magisk_status_loading: Loading status
+magisk_status_running: Running
+magisk_status_stopped: Stopped
+magisk_status_restarting: Restarting
+magisk_save_restart: Save and Restart
+magisk_command_args_warning: Startup argument mode is active, so the module ignores config.toml. Remove config/command_args before saving configuration here.
+magisk_invalid_module_directory: KernelSU returned an invalid module directory
+magisk_load_failed: 'Failed to load module configuration: {error}'
+magisk_save_failed: 'Failed to save module configuration: {error}'
+magisk_config_saved: Configuration validated and saved; EasyTier restarted
+magisk_config_saved_restart_pending: Configuration validated and saved; the EasyTier supervisor is still starting
 retain_network_instance: Retain Network Instance
 collect_network_infos: Collect Network Infos
 settings: Settings
@@ -42,6 +85,11 @@ logging_level_trace: Trace
 logging_level_off: Off
 logging_open_dir: Open Log Directory
 logging_copy_dir: Copy Log Path
+vpn_tile_no_network: No configured network
+vpn_tile_no_network_description: Configure a network in EasyTier before using the VPN tile.
+vpn_tile_started: VPN network started
+vpn_tile_stopped: VPN network stopped
+vpn_tile_action_failed: 'VPN tile action failed: {error}'
 disable_auto_launch: Disable Launch on Reboot
 enable_auto_launch: Enable Launch on Reboot
 hide_dock_icon: Hide Dock Icon
@@ -67,6 +115,21 @@ upload: Upload
 download: Download
 show_vpn_portal_config: Show VPN Portal Config
 vpn_portal_config: VPN Portal Config
+vpn_portal_not_configured: VPN Portal is not configured on this node
+vpn_portal_load_failed: Failed to load VPN Portal information
+vpn_portal_listener: Listener
+vpn_portal_type: Type
+vpn_portal_state: State
+vpn_portal_peer_id: Peer ID
+vpn_portal_endpoint: Client Endpoint
+vpn_portal_tunnel_ip: Client Tunnel Address
+vpn_portal_client_config: Client Config
+vpn_portal_copy_client_config: Copy Client Config
+vpn_portal_state_unspecified: Unknown
+vpn_portal_state_offline: Offline
+vpn_portal_state_connecting: Connecting
+vpn_portal_state_online: Online
+vpn_portal_state_error: Error
 show_event_log: Show Event Log
 event_log: Event Log
 peer_info: Peer Info
@@ -90,6 +153,9 @@ use_smoltcp_help: Use a user-space TCP/IP stack to avoid issues with operating s
 disable_ipv6: Disable IPv6
 disable_ipv6_help: Disable IPv6 functionality for this node, only use IPv4 for network communication.
 
+ipv6_public_addr_auto: Auto Public IPv6
+ipv6_public_addr_auto_help: Auto-obtain a public IPv6 address from a peer that shares its IPv6 subnet.
+
 enable_kcp_proxy: Enable KCP Proxy
 enable_kcp_proxy_help: Convert TCP traffic to KCP traffic to reduce latency and boost transmission speed.
 
@@ -103,10 +169,13 @@ disable_quic_input: Disable QUIC Input
 disable_quic_input_help: Disable inbound QUIC traffic, while nodes with QUIC proxy enabled continue to connect using TCP.
 
 disable_p2p: Disable P2P
-disable_p2p_help: Disable P2P mode; route all traffic through a manually specified relay server.
+disable_p2p_help: Disable ordinary automatic P2P. Nodes with need-p2p enabled can still establish P2P with this node.
 
 p2p_only: P2P Only
 p2p_only_help: Only communicate with peers that have already established P2P connections, do not relay through other nodes.
+
+lazy_p2p: Lazy P2P
+lazy_p2p_help: Only try to establish P2P when traffic actually targets a peer. Peers with need-p2p enabled are still connected proactively.
 
 bind_device: Bind to Physical Device Only
 bind_device_help: Use only the physical network interface to prevent EasyTier from connecting via virtual networks.
@@ -122,6 +191,9 @@ relay_all_peer_rpc_help: |
   Relay all peer rpc packets, even if the peer is not in the relay network whitelist.
   This can help peers not in relay network whitelist to establish p2p connection.
 
+need_p2p: Need P2P
+need_p2p_help: Ask other peers to proactively establish P2P connections to this node even when they enable lazy P2P.
+
 multi_thread: Multi Thread
 multi_thread_help: Use multi-thread runtime
 
@@ -129,10 +201,19 @@ proxy_forward_by_system: System Forward
 proxy_forward_by_system_help: Forward packet to proxy networks via system kernel, disable internal nat for network proxy
 
 disable_encryption: Disable Encryption
-disable_encryption_help: Disable encryption for peers communication, default is false, must be same with peers
+disable_encryption_help: Disable encryption for peers communication. Encryption is enabled by default, this option must be same with peers.
+
+disable_tcp_hole_punching: Disable TCP Hole Punching
+disable_tcp_hole_punching_help: Disable tcp hole punching
 
 disable_udp_hole_punching: Disable UDP Hole Punching
 disable_udp_hole_punching_help: Disable udp hole punching
+
+enable_udp_broadcast_relay: UDP Broadcast Relay
+enable_udp_broadcast_relay_help: "Windows only: capture local UDP broadcast packets from physical interfaces and forward them to EasyTier peers. Helps games to find rooms in local network. Requires administrator privileges."
+
+disable_upnp: Disable UPnP
+disable_upnp_help: Disable runtime UPnP/NAT-PMP port mapping for eligible listeners; automatic port mapping is enabled by default.
 
 disable_sym_hole_punching: Disable Symmetric NAT Hole Punching
 disable_sym_hole_punching_help: Disable special hole punching handling for symmetric NAT (based on birthday attack), treat symmetric NAT as cone NAT
@@ -173,6 +254,12 @@ mtu: MTU
 mtu_help: |
   MTU of the TUN device, default is 1380 for non-encryption, 1360 for encryption. Range:400-1380
 mtu_placeholder: Leave blank as default value 1380
+
+instance_recv_bps_limit: Instance Receive Limit
+instance_recv_bps_limit_help: |
+  Limit the total receive bandwidth for the whole instance. Unit: bytes per second.
+  Leave blank for no limit.
+instance_recv_bps_limit_placeholder: Leave blank for no limit
 
 mapped_listeners: Map Listeners
 mapped_listeners_help: |
@@ -225,6 +312,8 @@ event:
   DhcpIpv4Changed: DhcpIpv4Changed
   DhcpIpv4Conflicted: DhcpIpv4Conflicted
   PortForwardAdded: PortForwardAdded
+  ProxyCidrsUpdated: ProxyCidrsUpdated
+  UdpBroadcastRelayStartResult: UDP Broadcast Relay Start Result
 
 web:
   login:
@@ -238,6 +327,7 @@ web:
     captcha: Captcha
     back_to_login: Back to Login
     login: Login
+    sso_login: "SSO Login"
 
   register:
     title: Register
@@ -301,6 +391,8 @@ web:
     import_config: Import Config
     create_new: Create New Network
     network_status: Network Status
+    loading_network_status: Loading Network Status
+    network_info_unavailable: Network status is unavailable
     network_configuration: Network Configuration
     loading_network_configuration: Loading Network Configuration
     no_network_selected: No Network Selected
@@ -325,11 +417,15 @@ web:
     delete: Delete
     edit: Edit
     refresh: Refresh
+    add: Add
     loading: Loading...
     error: Error
     success: Success
     warning: Warning
     info: Info
+    enable: Enable
+    disable: Disable
+    address: Address
 
   settings:
     title: Settings
@@ -346,6 +442,8 @@ mode:
   switch_mode: Switch Mode
   config_dir: Config Dir
   rpc_portal: RPC Portal
+  enable_rpc_tcp_listen: Enable RPC port listening (TCP)
+  rpc_listen_port: RPC Listen Port
   log_level: Log Level
   log_dir: Log Dir
   remote_rpc_address: Remote RPC Address
@@ -366,6 +464,7 @@ mode:
   stop_service_success: Service stopped successfully
   remote_rpc_address_empty: Remote RPC Address cannot be empty
   service_config_empty: Service Config cannot be empty
+  rpc_connection_failed: "RPC connection failed: {error}"
 
 config-server:
   title: Config Server
@@ -386,3 +485,46 @@ config-server:
 client:
   not_running: Unable to connect to remote client.
   retry: Retry
+
+acl:
+  title: Access Control (ACL)
+  help: Access control list to restrict communication between nodes.
+  enabled: Enable ACL
+  default_action: Default Action
+  chains: Rule Chains
+  inbound: Inbound
+  outbound: Outbound
+  forward: Forward
+  rules: Rules
+  add_rule: Add Rule
+  edit_rule: Edit Rule
+  rule:
+    name: Rule Name
+    description: Description
+    enabled: Enabled
+    protocol: Protocol
+    action: Action
+    src_ips: Source IPs
+    dst_ips: Destination IPs
+    src_ports: Source Ports
+    dst_ports: Destination Ports
+    rate_limit: Rate Limit (pps)
+    burst_limit: Burst Limit
+    stateful: Stateful
+    src_groups: Source Groups
+    dst_groups: Destination Groups
+  groups: Groups
+  group:
+    declares: Declared Groups
+    members: Node Memberships
+    name: Group Name
+    secret: Group Secret
+    help: Define group identities in the network to use them in rules.
+  any: Any
+  allow: Allow
+  drop: Drop
+  delete_chain_confirm: Are you sure you want to delete this rule chain and all its rules?
+  chain:
+    name: Name
+    type: Type
+  match: Match

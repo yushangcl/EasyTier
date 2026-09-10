@@ -35,7 +35,7 @@ const currentNetworkConfig = ref<NetworkTypes.NetworkConfig | undefined>(undefin
 const listInstanceIdResponse = ref<Api.ListNetworkInstanceIdResponse | undefined>(undefined);
 
 const isRunning = (instanceId: string) => {
-    return listInstanceIdResponse.value?.running_inst_ids.map(Utils.UuidToStr).includes(instanceId);
+    return (listInstanceIdResponse.value?.running_inst_ids ?? []).map(Utils.UuidToStr).includes(instanceId);
 }
 
 const networkMetaCache = ref<Record<string, Api.NetworkMeta>>({});
@@ -46,7 +46,7 @@ const loadNetworkMetas = async (instanceIds: string[]) => {
 
     try {
         const response = await props.api.get_network_metas(missingIds);
-        Object.assign(networkMetaCache.value, response.metas);
+        Object.assign(networkMetaCache.value, response.metas ?? {});
     } catch (e) {
         console.error("Failed to load network metas", e);
     }
@@ -80,8 +80,8 @@ const updateInstanceList = () => {
     let insts = new Set<string>();
     let t = listInstanceIdResponse.value;
     if (t) {
-        t.running_inst_ids.forEach((u) => insts.add(Utils.UuidToStr(u)));
-        t.disabled_inst_ids.forEach((u) => insts.add(Utils.UuidToStr(u)));
+        (t.running_inst_ids ?? []).forEach((u) => insts.add(Utils.UuidToStr(u)));
+        (t.disabled_inst_ids ?? []).forEach((u) => insts.add(Utils.UuidToStr(u)));
     }
 
     const newList = Array.from(insts).map((instance: string) => {
@@ -149,7 +149,7 @@ const networkIsDisabled = computed(() => {
     if (!selectedInstanceId.value) {
         return false;
     }
-    return listInstanceIdResponse.value?.disabled_inst_ids.map(Utils.UuidToStr).includes(selectedInstanceId.value?.uuid);
+    return (listInstanceIdResponse.value?.disabled_inst_ids ?? []).map(Utils.UuidToStr).includes(selectedInstanceId.value?.uuid);
 });
 watch(networkIsDisabled, async (newVal, oldVal) => {
     if (newVal !== oldVal && newVal === true) {
@@ -206,27 +206,39 @@ const confirmDeleteNetwork = (event: any) => {
     });
 };
 
-const saveAndRunNewNetwork = async () => {
-    if (!currentNetworkConfig.value) {
+const saveAndRunNewNetwork = async (config?: NetworkTypes.NetworkConfig) => {
+    const cfg = config ?? currentNetworkConfig.value;
+    if (!cfg) {
         return;
     }
+
+    const targetInstanceId = instanceId.value ?? cfg.instance_id;
+    if (targetInstanceId && cfg.instance_id !== targetInstanceId) {
+        cfg.instance_id = targetInstanceId;
+    }
+
     try {
-        await props.api.delete_network(instanceId.value!);
-        let ret = await props.api.run_network(currentNetworkConfig.value, currentNetworkControl.remoteSave.value);
-        console.debug("saveAndRunNewNetwork", ret);
+        if (networkIsDisabled.value) {
+            await props.api.save_config(cfg);
+            await props.api.update_network_instance_state(cfg.instance_id, false);
+        } else {
+            await props.api.run_network(cfg, currentNetworkControl.remoteSave.value);
+        }
 
-        delete networkMetaCache.value[currentNetworkConfig.value.instance_id];
-        await loadNetworkMetas([currentNetworkConfig.value.instance_id]);
+        delete networkMetaCache.value[cfg.instance_id];
+        await loadNetworkMetas([cfg.instance_id]);
 
-        selectedInstanceId.value = { uuid: currentNetworkConfig.value.instance_id };
+        selectedInstanceId.value = { uuid: cfg.instance_id };
+        await loadNetworkInstanceIds();
+        await loadCurrentNetworkInfo();
     } catch (e: any) {
         console.error(e);
-        toast.add({ severity: 'error', summary: 'Error', detail: 'Failed to create network, error: ' + JSON.stringify(e.response.data), life: 2000 });
+        toast.add({ severity: 'error', summary: 'Error', detail: 'Failed to run network, error: ' + JSON.stringify(e.response?.data ?? e), life: 2000 });
         return;
     }
+
     emits('update');
-    // showCreateNetworkDialog.value = false;
-    isEditingNetwork.value = false; // Exit creation mode after successful network creation
+    isEditingNetwork.value = false;
 }
 
 const saveNetworkConfig = async () => {
@@ -275,17 +287,35 @@ const loadNetworkInstanceIds = async () => {
 }
 
 const loadCurrentNetworkInfo = async () => {
-    if (!selectedInstanceId.value) {
+    const selected = selectedInstanceId.value?.uuid;
+    if (!selected) {
+        curNetworkInfo.value = null;
         return;
     }
     if (!needShowNetworkStatus.value) {
+        curNetworkInfo.value = null;
+        return;
+    }
+    if (curNetworkInfo.value?.instance_id !== selected) {
+        curNetworkInfo.value = null;
+    }
+
+    let network_info = await props.api.get_network_info(selected);
+    if (selectedInstanceId.value?.uuid !== selected) {
         return;
     }
 
-    let network_info = await props.api.get_network_info(selectedInstanceId.value.uuid);
+    if (!network_info) {
+        curNetworkInfo.value = {
+            instance_id: selected,
+            running: false,
+            error_msg: t('web.device_management.network_info_unavailable'),
+        } as NetworkTypes.NetworkInstance;
+        return;
+    }
 
     curNetworkInfo.value = {
-        instance_id: selectedInstanceId.value.uuid,
+        instance_id: selected,
         running: network_info?.running ?? false,
         error_msg: network_info?.error_msg ?? '',
         detail: network_info,
@@ -388,18 +418,18 @@ const updateScreenWidth = () => {
 const menuRef = ref();
 const actionMenu: Ref<MenuItem[]> = ref([
     {
-        label: t('web.device_management.edit_network'),
+        label: () => t('web.device_management.edit_network'),
         icon: 'pi pi-pencil',
         visible: () => !(networkIsDisabled.value ?? true) && currentNetworkControl.editable.value,
         command: () => editNetwork()
     },
     {
-        label: t('web.device_management.export_config'),
+        label: () => t('web.device_management.export_config'),
         icon: 'pi pi-download',
         command: () => exportConfig()
     },
     {
-        label: t('web.device_management.delete_network'),
+        label: () => t('web.device_management.delete_network'),
         icon: 'pi pi-trash',
         class: 'p-error',
         visible: () => currentNetworkControl.deletable.value,
@@ -480,7 +510,7 @@ onUnmounted(() => {
                                     <div class="flex items-center min-w-0">
                                         <div class="mr-4 min-w-0 flex-1">
                                             <span class="truncate block">{{ t('network_name') }}: {{
-                                                slotProps.option.meta.network_name }}</span>
+                                                slotProps.option.meta?.network_name ?? slotProps.option.uuid }}</span>
                                         </div>
                                         <Tag class="my-auto leading-3 shrink-0"
                                             :severity="isRunning(slotProps.option.uuid) ? 'success' : 'info'"
@@ -539,13 +569,15 @@ onUnmounted(() => {
                         :label="t('web.device_management.edit_as_file')" iconPos="left" severity="secondary" />
                     <Button @click="importConfig" icon="pi pi-upload" :label="t('web.device_management.import_config')"
                         iconPos="left" severity="help" />
-                    <Button v-if="networkIsDisabled" @click="saveNetworkConfig" icon="pi pi-save"
-                        :label="t('web.device_management.save_config')" iconPos="left" severity="success" />
+                    <Button v-if="networkIsDisabled" @click="saveNetworkConfig" :disabled="!currentNetworkConfig"
+                        icon="pi pi-save" :label="t('web.device_management.save_config')" iconPos="left"
+                        severity="success" />
                 </div>
 
                 <Divider />
 
-                <Config :cur-network="currentNetworkConfig" @run-network="saveAndRunNewNetwork"></Config>
+                <Config :cur-network="currentNetworkConfig" :config-invalid="!currentNetworkConfig"
+                    @run-network="saveAndRunNewNetwork"></Config>
             </div>
 
             <!-- Network Status (for running networks) -->
@@ -555,10 +587,14 @@ onUnmounted(() => {
                     <h2 class="text-xl font-medium">{{ t('web.device_management.network_status') }}</h2>
                 </div>
 
-                <Status v-if="(curNetworkInfo?.error_msg ?? '') === ''" v-bind:cur-network-inst="curNetworkInfo"
+                <Status v-if="curNetworkInfo && curNetworkInfo.error_msg === ''" v-bind:cur-network-inst="curNetworkInfo"
+                    :api="api"
                     class="mb-4">
                 </Status>
-                <Message v-else severity="error" class="mb-4">{{ curNetworkInfo?.error_msg }}</Message>
+                <Message v-else-if="curNetworkInfo?.error_msg" severity="error" class="mb-4">{{
+                    curNetworkInfo.error_msg }}</Message>
+                <Message v-else severity="info" class="mb-4">{{ t('web.device_management.loading_network_status') }}
+                </Message>
 
                 <div class="text-center mt-4">
                     <Button @click="stopNetwork" :disabled="!currentNetworkControl.deletable.value"

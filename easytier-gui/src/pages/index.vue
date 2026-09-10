@@ -2,18 +2,27 @@
 
 import { type } from '@tauri-apps/plugin-os'
 
-import { appLogDir } from '@tauri-apps/api/path'
+import { invoke } from '@tauri-apps/api/core'
 import { writeText } from '@tauri-apps/plugin-clipboard-manager'
+import { open } from '@tauri-apps/plugin-shell'
 import { exit } from '@tauri-apps/plugin-process'
 import { I18nUtils, RemoteManagement, Utils } from "easytier-frontend-lib"
 import type { MenuItem } from 'primevue/menuitem'
 import { useTray } from '~/composables/tray'
+import {
+  consumePendingMobileVpnTileAction,
+  initMobileVpnService,
+  setMobileVpnTileActionHandler,
+  syncMobileVpnService,
+} from '~/composables/mobile_vpn'
+import { executeVpnTileAction } from '~/composables/mobile_vpn_tile'
 import { GUIRemoteClient } from '~/modules/api'
 
 import { useToast, useConfirm } from 'primevue'
 import { loadMode, saveMode, WebClientConfig, type Mode } from '~/composables/mode'
+import { saveLastNetworkInstanceId, loadLastNetworkInstanceId } from '~/composables/config'
 import ModeSwitcher from '~/components/ModeSwitcher.vue'
-import { getServiceStatus } from '~/composables/backend'
+import { getEasytierVersion, getServiceStatus } from '~/composables/backend'
 
 const { t, locale } = useI18n()
 const confirm = useConfirm()
@@ -82,6 +91,20 @@ async function onUninstallService() {
   });
 }
 
+function stripModeMetadata(mode: Mode) {
+  if (mode.mode !== 'service') {
+    return mode
+  }
+
+  const serviceConfig = { ...mode }
+  delete serviceConfig.installed_core_version
+  return serviceConfig
+}
+
+function modeConfigChanged(next: Mode) {
+  return JSON.stringify(stripModeMetadata(next)) !== JSON.stringify(stripModeMetadata(currentMode.value))
+}
+
 async function onStopService() {
   isModeSaving.value = true
   manualDisconnect.value = true
@@ -131,13 +154,14 @@ async function initWithMode(mode: Mode) {
       }
       url = mode.remote_rpc_address
       break;
-    case 'service':
+    case 'service': {
       if (!mode.config_dir || !mode.file_log_dir || !mode.file_log_level || !mode.rpc_portal) {
         toast.add({ severity: 'error', summary: t('error'), detail: t('mode.service_config_empty'), life: 10000 })
         return initWithMode({ ...mode, mode: 'normal' });
       }
       let serviceStatus = await getServiceStatus()
-      if (serviceStatus === "NotInstalled" || JSON.stringify(mode) !== JSON.stringify(currentMode.value)) {
+      const coreVersion = await getEasytierVersion()
+      if (serviceStatus === "NotInstalled" || modeConfigChanged(mode) || mode.installed_core_version !== coreVersion) {
         mode.config_server_url = mode.config_server_url || undefined
         await initService({
           config_dir: mode.config_dir,
@@ -146,6 +170,7 @@ async function initWithMode(mode: Mode) {
           rpc_portal: mode.rpc_portal,
           config_server: mode.config_server_url,
         })
+        mode.installed_core_version = coreVersion
         serviceStatus = await getServiceStatus()
       }
       if (serviceStatus === "Stopped") {
@@ -154,13 +179,24 @@ async function initWithMode(mode: Mode) {
       url = "tcp://" + mode.rpc_portal.replace("0.0.0.0", "127.0.0.1")
       retrys = 5
       break;
+    }
+    case 'normal':
+      url = mode.rpc_portal;
+      break;
   }
   for (let i = 0; i < retrys; i++) {
     try {
-      await connectRpcClient(url)
+      await connectRpcClient(mode.mode === 'normal', url)
       break;
     } catch (e) {
       if (i === retrys - 1) {
+        const errMsg = e instanceof Error ? e.message : String(e)
+        toast.add({
+          severity: 'error',
+          summary: t('error'),
+          detail: t('mode.rpc_connection_failed', { error: errMsg }),
+          life: 1000,
+        })
         throw e;
       }
       console.error("Error connecting rpc client, retrying...", e)
@@ -177,9 +213,35 @@ async function initWithMode(mode: Mode) {
   clientRunning.value = await isClientRunning()
 }
 
-onMounted(() => {
+onMounted(async () => {
+  const cleanupFns: Array<() => void> = []
+
+  if (type() === 'android') {
+    try {
+      await initMobileVpnService()
+    } catch (e: any) {
+      console.error("easytier init vpn service failed", e)
+    }
+  }
+
+  cleanupFns.push(await listenGlobalEvents())
   currentMode.value = loadMode()
-  initWithMode(currentMode.value);
+  await initWithMode(currentMode.value);
+
+  if (type() === 'android') {
+    setMobileVpnTileActionHandler(handleMobileVpnTileAction)
+    cleanupFns.push(() => setMobileVpnTileActionHandler())
+    try {
+      await consumePendingMobileVpnTileAction()
+      await syncMobileVpnService()
+    } catch (e: any) {
+      console.error("easytier sync vpn service failed", e)
+    }
+  }
+
+  onUnmounted(() => {
+    cleanupFns.forEach(unlisten => unlisten())
+  })
 });
 
 useTray(true)
@@ -189,6 +251,48 @@ const remoteClient = computed(() => new GUIRemoteClient());
 const instanceId = ref<string | undefined>(undefined);
 const clientRunning = ref(false);
 
+async function handleMobileVpnTileAction(action: 'start' | 'stop') {
+  try {
+    const result = await executeVpnTileAction(action, remoteClient.value, {
+      lastInstanceId: loadLastNetworkInstanceId(),
+      syncVpnService: syncMobileVpnService,
+    })
+
+    if (!result.instanceId) {
+      toast.add({
+        severity: 'warn',
+        summary: t('vpn_tile_no_network'),
+        detail: t('vpn_tile_no_network_description'),
+        life: 5000,
+      })
+      return
+    }
+
+    instanceId.value = result.instanceId
+    saveLastNetworkInstanceId(result.instanceId)
+    toast.add({
+      severity: action === 'start' ? 'success' : 'secondary',
+      summary: t(action === 'start' ? 'vpn_tile_started' : 'vpn_tile_stopped'),
+      life: 3000,
+    })
+  }
+  catch (error) {
+    console.error('VPN tile action failed', action, error)
+    toast.add({
+      severity: 'error',
+      summary: t('error'),
+      detail: t('vpn_tile_action_failed', { error: String(error) }),
+      life: 8000,
+    })
+  }
+}
+
+watch(instanceId, (newVal) => {
+  if (newVal) {
+    saveLastNetworkInstanceId(newVal);
+  }
+});
+
 watch(clientRunning, async (newVal, oldVal) => {
   if (!newVal && oldVal) {
     if (manualDisconnect.value) {
@@ -196,6 +300,11 @@ watch(clientRunning, async (newVal, oldVal) => {
       return
     }
     await reconnectClient()
+  } else if (newVal && !oldVal) {
+    const lastInstanceId = loadLastNetworkInstanceId();
+    if (lastInstanceId) {
+      instanceId.value = lastInstanceId;
+    }
   }
 })
 
@@ -231,6 +340,11 @@ onMounted(async () => {
 let current_log_level = 'off'
 
 const log_menu = ref()
+// 从后端获取正确的日志路径
+async function getLogDirPath(): Promise<string> {
+  return await invoke<string>('get_log_dir_path')
+}
+
 const log_menu_items_popup: Ref<MenuItem[]> = ref([
   ...['off', 'warn', 'info', 'debug', 'trace'].map(level => ({
     label: () => t(`logging_level_${level}`) + (current_log_level === level ? ' ✓' : ''),
@@ -246,15 +360,16 @@ const log_menu_items_popup: Ref<MenuItem[]> = ref([
     label: () => t('logging_open_dir'),
     icon: 'pi pi-folder-open',
     command: async () => {
-      // console.log('open log dir', await appLogDir())
-      await open(await appLogDir())
+      // console.log('open log dir', await getLogDirPath())
+      await open(await getLogDirPath())
     },
+    visible: () => type() !== 'android',
   },
   {
     label: () => t('logging_copy_dir'),
     icon: 'pi pi-tablet',
     command: async () => {
-      await writeText(await appLogDir())
+      await writeText(await getLogDirPath())
     },
   },
 ])
@@ -313,26 +428,10 @@ const setting_menu_items: Ref<MenuItem[]> = ref([
   },
 ])
 
-async function connectRpcClient(url?: string) {
-  await initRpcConnection(url)
-  console.log("easytier rpc connection established")
+async function connectRpcClient(isNormalMode: boolean, url?: string) {
+  await initRpcConnection(isNormalMode, url)
+  console.log("easytier rpc connection established, isNormalMode: ", isNormalMode)
 }
-
-onMounted(async () => {
-  if (type() === 'android') {
-    try {
-      await initMobileVpnService()
-      console.error("easytier init vpn service done")
-    } catch (e: any) {
-      console.error("easytier init vpn service failed", e)
-    }
-  }
-  const unlisten = await listenGlobalEvents()
-
-  onUnmounted(() => {
-    unlisten()
-  })
-})
 
 async function openConfigServerDialog() {
   editingMode.value = JSON.parse(JSON.stringify(loadMode()))

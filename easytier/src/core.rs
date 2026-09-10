@@ -1,39 +1,39 @@
-#![allow(dead_code)]
-
-use std::{
-    net::{IpAddr, SocketAddr},
-    path::PathBuf,
-    process::ExitCode,
-    sync::{atomic::AtomicBool, Arc},
-};
-
 use crate::{
+    ShellType,
     common::{
         config::{
-            get_avaliable_encrypt_methods, load_config_from_file, ConfigFileControl, ConfigLoader,
-            ConsoleLoggerConfig, FileLoggerConfig, LoggingConfigLoader, NetworkIdentity,
-            PeerConfig, PortForwardConfig, TomlConfigLoader, VpnPortalConfig,
+            ConfigFileControl, ConfigLoader, ConsoleLoggerConfig, EncryptionAlgorithm,
+            FileLoggerConfig, LoggingConfigLoader, NetworkIdentity, PeerConfig, PortForwardConfig,
+            TomlConfigLoader, VpnPortalClientConfig, VpnPortalConfig, add_proxy_network_to_config,
+            load_config_from_file, load_toml_config_from_path, parse_mapped_listener_urls,
         },
         constants::EASYTIER_VERSION,
+        log,
     },
-    defer,
-    instance_manager::NetworkInstanceManager,
-    launcher::add_proxy_network_to_config,
-    proto::common::CompressionAlgoPb,
+    instance::factory::native_cli_instance_manager,
+    proto::common::{CompressionAlgoPb, SecureModeConfig},
     rpc_service::ApiRpcServer,
-    tunnel::PROTO_PORT_OFFSET,
-    utils::{init_logger, setup_panic_handler},
+    utils::panic::setup_panic_handler,
     web_client,
 };
 use anyhow::Context;
 use cidr::IpCidr;
 use clap::{CommandFactory, Parser};
-use clap_complete::Shell;
+use easytier_core::config::normalize_secure_mode_config;
+use guarden::defer;
 use rust_i18n::t;
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    process::ExitCode,
+    sync::{Arc, atomic::AtomicBool},
+};
+use strum::VariantArray;
 use tokio::io::AsyncReadExt;
 
+use crate::tunnel::IpScheme;
 #[cfg(feature = "jemalloc-prof")]
-use jemalloc_ctl::{epoch, stats, Access as _, AsName as _};
+use jemalloc_ctl::{Access as _, AsName as _, epoch, stats};
 
 #[cfg(target_os = "windows")]
 windows_service::define_windows_service!(ffi_service_main, win_service_main);
@@ -47,6 +47,7 @@ fn set_prof_active(_active: bool) {
     }
 }
 
+#[cfg(feature = "jemalloc-prof")]
 fn get_dump_profile_path(cur_allocated: usize, suffix: &str) -> String {
     format!(
         "profile-{}-{}.{}",
@@ -126,7 +127,7 @@ struct Cli {
     rpc_portal_options: RpcPortalOptions,
 
     #[clap(long, help = t!("core_clap.generate_completions").to_string())]
-    gen_autocomplete: Option<Shell>,
+    gen_autocomplete: Option<ShellType>,
 
     #[clap(long, help = t!("core_clap.check_config").to_string())]
     check_config: bool,
@@ -168,6 +169,31 @@ struct NetworkOptions {
         help = t!("core_clap.ipv6").to_string()
     )]
     ipv6: Option<String>,
+
+    #[arg(
+        long,
+        env = "ET_IPV6_PUBLIC_ADDR_PROVIDER",
+        help = t!("core_clap.ipv6_public_addr_provider").to_string(),
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    ipv6_public_addr_provider: Option<bool>,
+
+    #[arg(
+        long,
+        env = "ET_IPV6_PUBLIC_ADDR_AUTO",
+        help = t!("core_clap.ipv6_public_addr_auto").to_string(),
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    ipv6_public_addr_auto: Option<bool>,
+
+    #[arg(
+        long,
+        env = "ET_IPV6_PUBLIC_ADDR_PREFIX",
+        help = t!("core_clap.ipv6_public_addr_prefix").to_string()
+    )]
+    ipv6_public_addr_prefix: Option<String>,
 
     #[arg(
         short,
@@ -257,6 +283,29 @@ struct NetworkOptions {
 
     #[arg(
         long,
+        env = "ET_VPN_PORTAL_PRIVATE_KEY",
+        help = t!("core_clap.vpn_portal_private_key").to_string()
+    )]
+    vpn_portal_private_key: Option<String>,
+
+    #[arg(
+        long = "vpn-portal-client",
+        env = "ET_VPN_PORTAL_CLIENT",
+        value_delimiter = ',',
+        help = t!("core_clap.vpn_portal_client").to_string()
+    )]
+    vpn_portal_clients: Vec<String>,
+
+    #[arg(
+        long = "vpn-portal-client-group",
+        env = "ET_VPN_PORTAL_CLIENT_GROUP",
+        value_delimiter = ',',
+        help = t!("core_clap.vpn_portal_client_group").to_string()
+    )]
+    vpn_portal_client_groups: Vec<String>,
+
+    #[arg(
+        long,
         env = "ET_DEFAULT_PROTOCOL",
         help = t!("core_clap.default_protocol").to_string()
     )]
@@ -276,9 +325,9 @@ struct NetworkOptions {
         long,
         env = "ET_ENCRYPTION_ALGORITHM",
         help = t!("core_clap.encryption_algorithm").to_string(),
-        value_parser = get_avaliable_encrypt_methods()
+        value_parser = crate::common::config::parse_encryption_algorithm,
     )]
-    encryption_algorithm: Option<String>,
+    encryption_algorithm: Option<EncryptionAlgorithm>,
 
     #[arg(
         long,
@@ -405,6 +454,15 @@ struct NetworkOptions {
 
     #[arg(
         long,
+        env = "ET_LAZY_P2P",
+        help = t!("core_clap.lazy_p2p").to_string(),
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    lazy_p2p: Option<bool>,
+
+    #[arg(
+        long,
         env = "ET_DISABLE_P2P",
         help = t!("core_clap.disable_p2p").to_string(),
         num_args = 0..=1,
@@ -423,6 +481,15 @@ struct NetworkOptions {
 
     #[arg(
         long,
+        env = "ET_DISABLE_TCP_HOLE_PUNCHING",
+        help = t!("core_clap.disable_tcp_hole_punching").to_string(),
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    disable_tcp_hole_punching: Option<bool>,
+
+    #[arg(
+        long,
         env = "ET_DISABLE_SYM_HOLE_PUNCHING",
         help = t!("core_clap.disable_sym_hole_punching").to_string(),
         num_args = 0..=1,
@@ -432,12 +499,39 @@ struct NetworkOptions {
 
     #[arg(
         long,
+        env = "ET_DISABLE_UPNP",
+        help = t!("core_clap.disable_upnp").to_string(),
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    disable_upnp: Option<bool>,
+
+    #[arg(
+        long,
+        env = "ET_ENABLE_UDP_BROADCAST_RELAY",
+        help = t!("core_clap.enable_udp_broadcast_relay").to_string(),
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    enable_udp_broadcast_relay: Option<bool>,
+
+    #[arg(
+        long,
         env = "ET_RELAY_ALL_PEER_RPC",
         help = t!("core_clap.relay_all_peer_rpc").to_string(),
         num_args = 0..=1,
         default_missing_value = "true"
     )]
     relay_all_peer_rpc: Option<bool>,
+
+    #[arg(
+        long,
+        env = "ET_NEED_P2P",
+        help = t!("core_clap.need_p2p").to_string(),
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    need_p2p: Option<bool>,
 
     #[cfg(feature = "socks5")]
     #[arg(
@@ -460,6 +554,17 @@ struct NetworkOptions {
         help = t!("core_clap.bind_device").to_string()
     )]
     bind_device: Option<bool>,
+
+    // SO_MARK (fwmark) is a Linux-family kernel feature. Gate the flag out
+    // entirely on other targets so users on Windows/macOS/BSD don't see a
+    // `--socket-mark` they can't act on.
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    #[arg(
+        long,
+        env = "ET_SOCKET_MARK",
+        help = t!("core_clap.socket_mark").to_string()
+    )]
+    socket_mark: Option<u32>,
 
     #[arg(
         long,
@@ -499,14 +604,6 @@ struct NetworkOptions {
 
     #[arg(
         long,
-        env = "ET_QUIC_LISTEN_PORT",
-        help = t!("core_clap.quic_listen_port").to_string(),
-        num_args = 0..=1,
-    )]
-    quic_listen_port: Option<u16>,
-
-    #[arg(
-        long,
         env = "ET_PORT_FORWARD",
         value_delimiter = ',',
         help = t!("core_clap.port_forward").to_string(),
@@ -543,6 +640,13 @@ struct NetworkOptions {
 
     #[arg(
         long,
+        env = "ET_INSTANCE_RECV_BPS_LIMIT",
+        help = t!("core_clap.instance_recv_bps_limit").to_string(),
+    )]
+    instance_recv_bps_limit: Option<u64>,
+
+    #[arg(
+        long,
         value_delimiter = ',',
         help = t!("core_clap.tcp_whitelist").to_string(),
         num_args = 0..
@@ -568,12 +672,30 @@ struct NetworkOptions {
 
     #[arg(
         long,
+        env = "ET_DISABLE_RELAY_QUIC",
+        help = t!("core_clap.disable_relay_quic").to_string(),
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    disable_relay_quic: Option<bool>,
+
+    #[arg(
+        long,
         env = "ET_ENABLE_RELAY_FOREIGN_NETWORK_KCP",
         help = t!("core_clap.enable_relay_foreign_network_kcp").to_string(),
         num_args = 0..=1,
         default_missing_value = "true"
     )]
     enable_relay_foreign_network_kcp: Option<bool>,
+
+    #[arg(
+        long,
+        env = "ET_ENABLE_RELAY_FOREIGN_NETWORK_QUIC",
+        help = t!("core_clap.enable_relay_foreign_network_quic").to_string(),
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    enable_relay_foreign_network_quic: Option<bool>,
 
     #[arg(
         long,
@@ -592,6 +714,52 @@ struct NetworkOptions {
         num_args = 0..
     )]
     stun_servers_v6: Option<Vec<String>>,
+
+    #[arg(
+        long,
+        env = "ET_TCP_STUN_SERVERS",
+        value_delimiter = ',',
+        help = t!("core_clap.tcp_stun_servers").to_string(),
+        num_args = 0..
+    )]
+    tcp_stun_servers: Option<Vec<String>>,
+
+    #[arg(
+        long,
+        env = "ET_SECURE_MODE",
+        help = t!("core_clap.secure_mode").to_string(),
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    secure_mode: Option<bool>,
+
+    #[arg(
+        long,
+        env = "ET_LOCAL_PRIVATE_KEY",
+        help = t!("core_clap.local_private_key").to_string()
+    )]
+    local_private_key: Option<String>,
+
+    #[arg(
+        long,
+        env = "ET_LOCAL_PUBLIC_KEY",
+        help = t!("core_clap.local_public_key").to_string()
+    )]
+    local_public_key: Option<String>,
+
+    #[arg(
+        long,
+        env = "ET_CREDENTIAL",
+        help = t!("core_clap.credential").to_string()
+    )]
+    credential: Option<String>,
+
+    #[arg(
+        long,
+        env = "ET_CREDENTIAL_FILE",
+        help = t!("core_clap.credential_file").to_string()
+    )]
+    credential_file: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -652,81 +820,199 @@ struct RpcPortalOptions {
 }
 
 impl Cli {
+    fn gen_listeners(addr: SocketAddr) -> impl Iterator<Item = String> {
+        let dynamic = addr.port() == 0;
+        IpScheme::VARIANTS.iter().map(move |proto| {
+            let mut addr = addr;
+            if !dynamic {
+                addr.set_port(addr.port() + proto.port_offset());
+            }
+            format!("{}://{}", proto, addr)
+        })
+    }
+
     fn parse_listeners(no_listener: bool, listeners: Vec<String>) -> anyhow::Result<Vec<String>> {
         if no_listener || listeners.is_empty() {
             return Ok(vec![]);
         }
 
-        let origin_listeners = listeners;
-        let mut listeners: Vec<String> = Vec::new();
-        if origin_listeners.len() == 1 {
-            if let Ok(port) = origin_listeners[0].parse::<u16>() {
-                for (proto, offset) in PROTO_PORT_OFFSET {
-                    listeners.push(format!("{}://0.0.0.0:{}", proto, port + *offset));
-                }
-                return Ok(listeners);
+        let mut parsed = vec![];
+
+        for l in listeners.into_iter() {
+            if let Ok(port) = l.parse::<u16>() {
+                parsed.extend(Self::gen_listeners(SocketAddr::new(
+                    "0.0.0.0".parse()?,
+                    port,
+                )));
+                continue;
             }
+
+            if let Ok(ip) = l.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>() {
+                parsed.extend(Self::gen_listeners(SocketAddr::new(ip, 11010)));
+                continue;
+            }
+
+            if let Ok(addr) = l.parse::<SocketAddr>() {
+                parsed.extend(Self::gen_listeners(addr));
+                continue;
+            }
+
+            let (scheme, rest) = l.split_once(':').unwrap_or((&l, ""));
+            let Ok(scheme) = scheme.parse::<IpScheme>() else {
+                anyhow::bail!("invalid listener: {}", l);
+            };
+
+            if rest.is_empty() {
+                parsed.push(format!(
+                    "{}://0.0.0.0:{}",
+                    scheme,
+                    11010 + scheme.port_offset()
+                ));
+                continue;
+            }
+
+            if let Ok(port) = rest.parse::<u16>() {
+                parsed.push(format!("{}://0.0.0.0:{}", scheme, port));
+                continue;
+            }
+
+            if !l.parse::<url::Url>()?.has_authority() {
+                anyhow::bail!("invalid listener: {}", l);
+            }
+            parsed.push(l);
         }
 
-        for l in &origin_listeners {
-            let proto_port: Vec<&str> = l.split(':').collect();
-            if proto_port.len() > 2 {
-                if let Ok(url) = l.parse::<url::Url>() {
-                    listeners.push(url.to_string());
-                } else {
-                    panic!("failed to parse listener: {}", l);
-                }
-            } else {
-                let Some((proto, offset)) = PROTO_PORT_OFFSET
-                    .iter()
-                    .find(|(proto, _)| *proto == proto_port[0])
-                else {
-                    return Err(anyhow::anyhow!("unknown protocol: {}", proto_port[0]));
-                };
-
-                let port = if proto_port.len() == 2 {
-                    proto_port[1].parse::<u16>().unwrap()
-                } else {
-                    11010 + offset
-                };
-
-                listeners.push(format!("{}://0.0.0.0:{}", proto, port));
-            }
-        }
-
-        Ok(listeners)
+        Ok(parsed)
     }
 }
 
 impl NetworkOptions {
-    fn can_merge(&self, cfg: &TomlConfigLoader, config_file_count: usize) -> bool {
+    fn parse_vpn_portal_listener(value: &str) -> anyhow::Result<SocketAddr> {
+        let url: url::Url = value
+            .parse()
+            .with_context(|| format!("failed to parse vpn portal url: {value}"))?;
+        if url.scheme() != "wg" {
+            anyhow::bail!("vpn portal URL must use the wg scheme: {value}");
+        }
+        if !url.path().is_empty() {
+            anyhow::bail!(
+                "legacy VPN portal CIDR paths are no longer supported; use wg://host:port and configure --vpn-portal-client NAME=CIDR"
+            );
+        }
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            anyhow::bail!("vpn portal URL must have the form wg://host:port");
+        }
+
+        let host: IpAddr = url
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("vpn portal url missing host"))?
+            .parse()
+            .with_context(|| "vpn portal listener host must be an IP address")?;
+        let port = url
+            .port()
+            .ok_or_else(|| anyhow::anyhow!("vpn portal url missing port"))?;
+        Ok(SocketAddr::new(host, port))
+    }
+
+    fn parse_vpn_portal_clients(&self) -> anyhow::Result<Vec<VpnPortalClientConfig>> {
+        let mut clients = self
+            .vpn_portal_clients
+            .iter()
+            .map(|value| {
+                let (name, virtual_ip) = value.split_once('=').ok_or_else(|| {
+                    anyhow::anyhow!("invalid vpn portal client {value:?}; expected NAME=CIDR")
+                })?;
+                if name.is_empty() {
+                    anyhow::bail!("vpn portal client name cannot be empty");
+                }
+                if !virtual_ip.contains('/') {
+                    anyhow::bail!(
+                        "invalid vpn portal client {value:?}; expected NAME=CIDR, for example alice=10.144.0.5/16"
+                    );
+                }
+                Ok(VpnPortalClientConfig {
+                    name: name.to_owned(),
+                    virtual_ip: virtual_ip.parse().with_context(|| {
+                        format!("invalid virtual CIDR for vpn portal client {name}: {virtual_ip}")
+                    })?,
+                    groups: Vec::new(),
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        for value in &self.vpn_portal_client_groups {
+            let (name, group) = value.split_once('=').ok_or_else(|| {
+                anyhow::anyhow!("invalid vpn portal client group {value:?}; expected NAME=GROUP")
+            })?;
+            if name.is_empty() || group.is_empty() {
+                anyhow::bail!("vpn portal client group name and group cannot be empty");
+            }
+            let client = clients
+                .iter_mut()
+                .find(|client| client.name == name)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("vpn portal client group references unknown CLI client: {name}")
+                })?;
+            client.groups.push(group.to_owned());
+        }
+
+        Ok(clients)
+    }
+
+    fn can_merge(
+        &self,
+        cfg: &TomlConfigLoader,
+        source: ConfigFileSource,
+        explicit_config_file_count: usize,
+        config_dir_file_count: usize,
+    ) -> bool {
         if (*self) == NetworkOptions::default() {
             return false;
         }
-        if config_file_count == 1 {
+
+        if source == ConfigFileSource::CliConfigFile
+            && explicit_config_file_count == 1
+            && config_dir_file_count == 0
+        {
             return true;
         }
+
         let Some(network_name) = &self.network_name else {
             return false;
         };
-        if cfg.get_network_identity().network_name == *network_name {
-            return true;
+
+        if source == ConfigFileSource::ConfigDir {
+            return cfg.get_network_identity().network_name == *network_name;
         }
-        false
+
+        cfg.get_network_identity().network_name == *network_name
     }
 
-    fn merge_into(&self, cfg: &mut TomlConfigLoader) -> anyhow::Result<()> {
+    fn merge_into(&self, cfg: &TomlConfigLoader) -> anyhow::Result<()> {
         if self.hostname.is_some() {
             cfg.set_hostname(self.hostname.clone());
         }
 
         let old_ns = cfg.get_network_identity();
-        let network_name = self.network_name.clone().unwrap_or(old_ns.network_name);
-        let network_secret = self
-            .network_secret
+        let network_name = self
+            .network_name
             .clone()
-            .unwrap_or(old_ns.network_secret.unwrap_or_default());
-        cfg.set_network_identity(NetworkIdentity::new(network_name, network_secret));
+            .unwrap_or_else(|| old_ns.network_name.clone());
+
+        if self.credential.is_some() {
+            // Credential mode: no network_secret, authenticate via credential keypair
+            cfg.set_network_identity(NetworkIdentity::new_credential(network_name));
+        } else if let Some(network_secret) = &self.network_secret {
+            cfg.set_network_identity(NetworkIdentity::new(network_name, network_secret.clone()));
+        } else if let Some(network_secret) = old_ns.network_secret {
+            cfg.set_network_identity(NetworkIdentity::new(network_name, network_secret));
+        } else {
+            cfg.set_network_identity(NetworkIdentity::new_credential(network_name));
+        }
 
         if let Some(dhcp) = self.dhcp {
             cfg.set_dhcp(dhcp);
@@ -744,6 +1030,20 @@ impl NetworkOptions {
             })?))
         }
 
+        if let Some(enabled) = self.ipv6_public_addr_provider {
+            cfg.set_ipv6_public_addr_provider(enabled);
+        }
+
+        if let Some(enabled) = self.ipv6_public_addr_auto {
+            cfg.set_ipv6_public_addr_auto(enabled);
+        }
+
+        if let Some(prefix) = &self.ipv6_public_addr_prefix {
+            cfg.set_ipv6_public_addr_prefix(Some(prefix.parse().with_context(|| {
+                format!("failed to parse ipv6 public address prefix: {}", prefix)
+            })?));
+        }
+
         if !self.peers.is_empty() {
             let mut peers = cfg.get_peers();
             peers.reserve(peers.len() + self.peers.len());
@@ -752,6 +1052,7 @@ impl NetworkOptions {
                     uri: p
                         .parse()
                         .with_context(|| format!("failed to parse peer uri: {}", p))?,
+                    peer_public_key: None,
                 });
             }
             cfg.set_peers(peers);
@@ -759,7 +1060,8 @@ impl NetworkOptions {
 
         if self.no_listener || !self.listeners.is_empty() {
             cfg.set_listeners(
-                Cli::parse_listeners(self.no_listener, self.listeners.clone())?
+                Cli::parse_listeners(self.no_listener, self.listeners.clone())
+                    .with_context(|| format!("failed to parse listeners: {:?}", self.listeners))?
                     .into_iter()
                     .map(|s| s.parse().unwrap())
                     .collect(),
@@ -774,32 +1076,7 @@ impl NetworkOptions {
         }
 
         if !self.mapped_listeners.is_empty() {
-            let mut errs = Vec::new();
-            cfg.set_mapped_listeners(Some(
-                self.mapped_listeners
-                    .iter()
-                    .map(|s| {
-                        s.parse()
-                            .with_context(|| format!("mapped listener is not a valid url: {}", s))
-                            .unwrap()
-                    })
-                    .map(|s: url::Url| {
-                        if s.port().is_none() {
-                            errs.push(anyhow::anyhow!("mapped listener port is missing: {}", s));
-                        }
-                        s
-                    })
-                    .collect::<Vec<_>>(),
-            ));
-            if !errs.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "{}",
-                    errs.iter()
-                        .map(|x| format!("{}", x))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                ));
-            }
+            cfg.set_mapped_listeners(Some(parse_mapped_listener_urls(&self.mapped_listeners)?));
         }
 
         for n in self.proxy_networks.iter() {
@@ -812,6 +1089,7 @@ impl NetworkOptions {
                 uri: external_nodes.parse().with_context(|| {
                     format!("failed to parse external node uri: {}", external_nodes)
                 })?,
+                peer_public_key: None,
             });
             cfg.set_peers(old_peers);
         }
@@ -820,23 +1098,41 @@ impl NetworkOptions {
             cfg.set_inst_name(inst_name.clone());
         }
 
-        if let Some(vpn_portal) = self.vpn_portal.as_ref() {
-            let url: url::Url = vpn_portal
-                .parse()
-                .with_context(|| format!("failed to parse vpn portal url: {}", vpn_portal))?;
-            let host = url
-                .host_str()
-                .ok_or_else(|| anyhow::anyhow!("vpn portal url missing host"))?;
-            let port = url
-                .port()
-                .ok_or_else(|| anyhow::anyhow!("vpn portal url missing port"))?;
-            let client_cidr = url.path()[1..].parse().with_context(|| {
-                format!("failed to parse vpn portal client cidr: {}", url.path())
-            })?;
-            let wireguard_listen: SocketAddr = format!("{}:{}", host, port).parse().unwrap();
+        let has_vpn_portal_overrides = self.vpn_portal.is_some()
+            || self.vpn_portal_private_key.is_some()
+            || !self.vpn_portal_clients.is_empty()
+            || !self.vpn_portal_client_groups.is_empty();
+        if has_vpn_portal_overrides {
+            if self.vpn_portal_clients.is_empty() && !self.vpn_portal_client_groups.is_empty() {
+                anyhow::bail!(
+                    "--vpn-portal-client-group requires at least one --vpn-portal-client"
+                );
+            }
+
+            let existing = cfg.get_vpn_portal_config();
+            let wireguard_listen = match self.vpn_portal.as_deref() {
+                Some(value) => Self::parse_vpn_portal_listener(value)?,
+                None => existing
+                    .as_ref()
+                    .map(|portal| portal.wireguard_listen)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("--vpn-portal is required when no vpn_portal_config exists")
+                    })?,
+            };
+            let wireguard_private_key = self
+                .vpn_portal_private_key
+                .clone()
+                .or_else(|| existing.as_ref()?.wireguard_private_key.clone());
+            let clients = if self.vpn_portal_clients.is_empty() {
+                existing.map_or_else(Vec::new, |portal| portal.clients)
+            } else {
+                self.parse_vpn_portal_clients()?
+            };
+
             cfg.set_vpn_portal_config(VpnPortalConfig {
                 wireguard_listen,
-                client_cidr,
+                wireguard_private_key,
+                clients,
             });
         }
 
@@ -860,7 +1156,6 @@ impl NetworkOptions {
             ));
         }
 
-        #[cfg(feature = "socks5")]
         for port_forward in self.port_forward.iter() {
             let example_str = ", example: udp://0.0.0.0:12345/10.126.126.1:12345";
 
@@ -894,6 +1189,40 @@ impl NetworkOptions {
             cfg.set_port_forwards(old);
         }
 
+        if let Some(ref credential_file) = self.credential_file {
+            cfg.set_credential_file(Some(credential_file.clone()));
+        }
+
+        if let Some(ref credential_secret) = self.credential {
+            // --credential implies --secure-mode and sets the credential private key
+            let c = SecureModeConfig {
+                enabled: true,
+                local_private_key: Some(credential_secret.clone()),
+                local_public_key: None,
+            };
+            cfg.set_secure_mode(Some(normalize_secure_mode_config(c)?));
+        } else if let Some(secure_mode) = self.secure_mode
+            && secure_mode
+        {
+            // CLI key options replace the file's [secure_mode] keypair as a unit;
+            // without them the keys already loaded from the config file win.
+            let cli_private_key = self.local_private_key.clone().filter(|k| !k.is_empty());
+            let cli_public_key = self.local_public_key.clone().filter(|k| !k.is_empty());
+            let (local_private_key, local_public_key) =
+                if cli_private_key.is_some() || cli_public_key.is_some() {
+                    (cli_private_key, cli_public_key)
+                } else {
+                    cfg.get_secure_mode()
+                        .map_or((None, None), |c| (c.local_private_key, c.local_public_key))
+                };
+            let c = SecureModeConfig {
+                enabled: secure_mode,
+                local_private_key,
+                local_public_key,
+            };
+            cfg.set_secure_mode(Some(normalize_secure_mode_config(c)?));
+        }
+
         let mut f = cfg.get_flags();
         if let Some(default_protocol) = &self.default_protocol {
             f.default_protocol = default_protocol.clone()
@@ -902,7 +1231,7 @@ impl NetworkOptions {
             f.enable_encryption = !v;
         }
         if let Some(algorithm) = &self.encryption_algorithm {
-            f.encryption_algorithm = algorithm.clone();
+            f.encryption_algorithm = algorithm.to_string();
         }
         if let Some(v) = self.disable_ipv6 {
             f.enable_ipv6 = !v;
@@ -925,10 +1254,15 @@ impl NetworkOptions {
         }
         f.disable_p2p = self.disable_p2p.unwrap_or(f.disable_p2p);
         f.p2p_only = self.p2p_only.unwrap_or(f.p2p_only);
+        f.lazy_p2p = self.lazy_p2p.unwrap_or(f.lazy_p2p);
+        f.disable_tcp_hole_punching = self
+            .disable_tcp_hole_punching
+            .unwrap_or(f.disable_tcp_hole_punching);
         f.disable_udp_hole_punching = self
             .disable_udp_hole_punching
             .unwrap_or(f.disable_udp_hole_punching);
         f.relay_all_peer_rpc = self.relay_all_peer_rpc.unwrap_or(f.relay_all_peer_rpc);
+        f.need_p2p = self.need_p2p.unwrap_or(f.need_p2p);
         f.multi_thread = self.multi_thread.unwrap_or(f.multi_thread);
         if let Some(compression) = &self.compression {
             f.data_compress_algo = match compression.as_str() {
@@ -942,24 +1276,38 @@ impl NetworkOptions {
             .into();
         }
         f.bind_device = self.bind_device.unwrap_or(f.bind_device);
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        {
+            f.socket_mark = self.socket_mark.or(f.socket_mark);
+        }
         f.enable_kcp_proxy = self.enable_kcp_proxy.unwrap_or(f.enable_kcp_proxy);
         f.disable_kcp_input = self.disable_kcp_input.unwrap_or(f.disable_kcp_input);
         f.enable_quic_proxy = self.enable_quic_proxy.unwrap_or(f.enable_quic_proxy);
         f.disable_quic_input = self.disable_quic_input.unwrap_or(f.disable_quic_input);
-        if let Some(quic_listen_port) = self.quic_listen_port {
-            f.quic_listen_port = quic_listen_port as u32;
-        }
         f.accept_dns = self.accept_dns.unwrap_or(f.accept_dns);
         f.private_mode = self.private_mode.unwrap_or(f.private_mode);
         f.foreign_relay_bps_limit = self
             .foreign_relay_bps_limit
             .unwrap_or(f.foreign_relay_bps_limit);
+        f.instance_recv_bps_limit = self
+            .instance_recv_bps_limit
+            .unwrap_or(f.instance_recv_bps_limit);
         f.multi_thread_count = self.multi_thread_count.unwrap_or(f.multi_thread_count);
         f.disable_relay_kcp = self.disable_relay_kcp.unwrap_or(f.disable_relay_kcp);
+        f.disable_relay_quic = self.disable_relay_quic.unwrap_or(f.disable_relay_quic);
         f.enable_relay_foreign_network_kcp = self
             .enable_relay_foreign_network_kcp
             .unwrap_or(f.enable_relay_foreign_network_kcp);
-        f.disable_sym_hole_punching = self.disable_sym_hole_punching.unwrap_or(false);
+        f.enable_relay_foreign_network_quic = self
+            .enable_relay_foreign_network_quic
+            .unwrap_or(f.enable_relay_foreign_network_quic);
+        f.disable_sym_hole_punching = self
+            .disable_sym_hole_punching
+            .unwrap_or(f.disable_sym_hole_punching);
+        f.disable_upnp = self.disable_upnp.unwrap_or(f.disable_upnp);
+        f.enable_udp_broadcast_relay = self
+            .enable_udp_broadcast_relay
+            .unwrap_or(f.enable_udp_broadcast_relay);
         // Configure tld_dns_zone: use provided value if set
         if let Some(tld_dns_zone) = &self.tld_dns_zone {
             f.tld_dns_zone = tld_dns_zone.clone();
@@ -979,18 +1327,42 @@ impl NetworkOptions {
         cfg.set_udp_whitelist(old_udp_whitelist);
 
         if let Some(stun_servers) = &self.stun_servers {
-            let mut old_stun_servers = cfg.get_stun_servers().unwrap_or_default();
-            old_stun_servers.extend(stun_servers.iter().cloned());
-            cfg.set_stun_servers(Some(old_stun_servers));
+            if stun_servers.is_empty() {
+                cfg.set_stun_servers(Some(Vec::new()));
+            } else {
+                let mut old_stun_servers = cfg.get_stun_servers().unwrap_or_default();
+                old_stun_servers.extend(stun_servers.iter().cloned());
+                cfg.set_stun_servers(Some(old_stun_servers));
+            }
         }
 
         if let Some(stun_servers_v6) = &self.stun_servers_v6 {
-            let mut old_stun_servers_v6 = cfg.get_stun_servers_v6().unwrap_or_default();
-            old_stun_servers_v6.extend(stun_servers_v6.iter().cloned());
-            cfg.set_stun_servers_v6(Some(old_stun_servers_v6));
+            if stun_servers_v6.is_empty() {
+                cfg.set_stun_servers_v6(Some(Vec::new()));
+            } else {
+                let mut old_stun_servers_v6 = cfg.get_stun_servers_v6().unwrap_or_default();
+                old_stun_servers_v6.extend(stun_servers_v6.iter().cloned());
+                cfg.set_stun_servers_v6(Some(old_stun_servers_v6));
+            }
+        }
+
+        if let Some(tcp_stun_servers) = &self.tcp_stun_servers {
+            if tcp_stun_servers.is_empty() {
+                cfg.set_tcp_stun_servers(Some(Vec::new()));
+            } else {
+                let mut old_tcp_stun_servers = cfg.get_tcp_stun_servers().unwrap_or_default();
+                old_tcp_stun_servers.extend(tcp_stun_servers.iter().cloned());
+                cfg.set_tcp_stun_servers(Some(old_tcp_stun_servers));
+            }
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigFileSource {
+    CliConfigFile,
+    ConfigDir,
 }
 
 impl LoggingConfigLoader for &LoggingOptions {
@@ -1014,8 +1386,7 @@ impl LoggingConfigLoader for &LoggingOptions {
 #[cfg(target_os = "windows")]
 fn win_service_set_work_dir(service_name: &std::ffi::OsString) -> anyhow::Result<()> {
     use crate::common::constants::WIN_SERVICE_WORK_DIR_REG_KEY;
-    use winreg::enums::*;
-    use winreg::RegKey;
+    use winreg::{RegKey, enums::*};
 
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
     let key = hklm.open_subkey_with_flags(WIN_SERVICE_WORK_DIR_REG_KEY, KEY_READ)?;
@@ -1066,9 +1437,9 @@ fn win_service_event_loop(
                             status_handle.set_service_status(normal_status).unwrap();
                             std::process::exit(0);
                         }
-                        Err(e) => {
+                        Err(error) => {
                             status_handle.set_service_status(error_status).unwrap();
-                            eprintln!("error: {}", e);
+                            log::error!(?error);
                         }
                     }
                 },
@@ -1090,16 +1461,17 @@ fn parse_cli() -> Cli {
     if let Some(stun_servers_v6) = &mut cli.network_options.stun_servers_v6 {
         stun_servers_v6.retain(|s| !s.trim().is_empty());
     }
+    if let Some(tcp_stun_servers) = &mut cli.network_options.tcp_stun_servers {
+        tcp_stun_servers.retain(|s| !s.trim().is_empty());
+    }
     cli
 }
 
 #[cfg(target_os = "windows")]
 fn win_service_main(arg: Vec<std::ffi::OsString>) {
-    use std::sync::Arc;
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
     use tokio::sync::Notify;
-    use windows_service::service::*;
-    use windows_service::service_control_handler::*;
+    use windows_service::{service::*, service_control_handler::*};
 
     _ = win_service_set_work_dir(&arg[0]);
 
@@ -1136,9 +1508,9 @@ fn win_service_main(arg: Vec<std::ffi::OsString>) {
 
 async fn run_main(cli: Cli) -> anyhow::Result<()> {
     defer!(dump_profile(0););
-    init_logger(&cli.logging_options, true)?;
+    log::init(&cli.logging_options, true)?;
 
-    let manager = Arc::new(NetworkInstanceManager::new().with_config_path(cli.config_dir.clone()));
+    let manager = Arc::new(native_cli_instance_manager().with_config_path(cli.config_dir.clone()));
 
     let _rpc_server = ApiRpcServer::new(
         cli.rpc_portal_options.rpc_portal,
@@ -1151,19 +1523,23 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
     let _web_client = if let Some(config_server_url_s) = cli.config_server.as_ref() {
         let wc = web_client::run_web_client(
             config_server_url_s,
-            cli.machine_id.clone(),
+            crate::common::MachineIdOptions {
+                explicit_machine_id: cli.machine_id.clone(),
+                state_dir: None,
+            },
             cli.network_options.hostname.clone(),
+            cli.network_options.secure_mode.unwrap_or(false),
             manager.clone(),
             None,
         )
         .await
         .inspect(|_| {
-            println!(
-                "Web client started successfully...\nserver: {}",
-                config_server_url_s,
+            log::info!(
+                server = config_server_url_s,
+                "Web client started successfully...",
             );
 
-            println!("Official config website: https://easytier.cn/web");
+            log::info!("Official config website: https://easytier.cn/web");
         })?;
 
         Some(wc)
@@ -1177,8 +1553,13 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
         None
     };
 
+    let explicit_config_file_count = cli.config_file.as_ref().map_or(0, |files| files.len());
+    let mut config_dir_file_count = 0;
     let mut config_files = if let Some(v) = cli.config_file {
-        v.clone()
+        v.iter()
+            .cloned()
+            .map(|path| (path, ConfigFileSource::CliConfigFile))
+            .collect()
     } else {
         vec![]
     };
@@ -1199,7 +1580,8 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
             if ext != "toml" {
                 continue;
             }
-            config_files.push(path);
+            config_dir_file_count += 1;
+            config_files.push((path, ConfigFileSource::ConfigDir));
         }
     }
     let config_file_count = config_files.len();
@@ -1212,43 +1594,57 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
             cli.network_options.network_name.is_some()
         }
     };
-    for config_file in config_files {
-        let (mut cfg, mut control) = load_config_from_file(
+    for (config_file, source) in config_files {
+        let (cfg, mut control) = load_config_from_file(
             &config_file,
             cli.config_dir.as_ref(),
             cli.disable_env_parsing,
         )
         .await?;
 
-        if cli.network_options.can_merge(&cfg, config_file_count) {
+        if cli.network_options.can_merge(
+            &cfg,
+            source,
+            explicit_config_file_count,
+            config_dir_file_count,
+        ) {
             cli.network_options
-                .merge_into(&mut cfg)
+                .merge_into(&cfg)
                 .with_context(|| format!("failed to merge config from cli: {:?}", config_file))?;
             crate_cli_network = false;
             control.set_read_only(true);
             control.set_no_delete(true);
         }
 
-        println!(
-            "Starting easytier from config file {:?}({:?}) with config:",
-            config_file, control.permission
+        log::info!(
+            "\
+            Starting easytier from config file {:?}({:?}) with config:\n\
+            ############### TOML ###############\n\
+            {}\n\
+            -----------------------------------\n\
+            ",
+            config_file,
+            control.permission,
+            cfg.dump_redacted()
         );
-        println!("############### TOML ###############\n");
-        println!("{}", cfg.dump());
-        println!("-----------------------------------");
-        manager.run_network_instance(cfg, true, control)?;
+        manager.run_network_instance(cfg, control)?;
     }
 
     if crate_cli_network {
-        let mut cfg = TomlConfigLoader::default();
+        let cfg = TomlConfigLoader::default();
         cli.network_options
-            .merge_into(&mut cfg)
+            .merge_into(&cfg)
             .with_context(|| "failed to create config from cli".to_string())?;
-        println!("Starting easytier from cli with config:");
-        println!("############### TOML ###############\n");
-        println!("{}", cfg.dump());
-        println!("-----------------------------------");
-        manager.run_network_instance(cfg, true, ConfigFileControl::STATIC_CONFIG)?;
+        log::info!(
+            "\
+            Starting easytier from cli with config:\n\
+            ############### TOML ###############\n\
+            {}\n\
+            -----------------------------------\n\
+            ",
+            cfg.dump_redacted()
+        );
+        manager.run_network_instance(cfg, ConfigFileControl::STATIC_CONFIG)?;
     }
 
     #[cfg(unix)]
@@ -1261,20 +1657,18 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
     tokio::select! {
         _ = manager.wait() => {
             let infos = manager.collect_network_infos().await?;
-            let errs = infos
+            if infos
                 .into_values()
-                .filter_map(|info| info.error_msg)
-                .collect::<Vec<_>>();
-            if !errs.is_empty() {
+                .filter_map(|info| info.error_msg).next().is_some() {
                 return Err(anyhow::anyhow!("some instances stopped with errors"));
             }
         }
         _ = tokio::signal::ctrl_c() => {
-            println!("ctrl-c received, exiting...");
+            log::info!("ctrl-c received, exiting...");
         }
 
         _ = sigterm, if cfg!(unix) => {
-            println!("terminate signal received, exiting...");
+            log::warn!("terminate signal received, exiting...");
         }
     }
     Ok(())
@@ -1291,11 +1685,7 @@ fn memory_monitor(_force_dump: Arc<AtomicBool>) {
             e.advance().unwrap();
             let new_heap_size = allocated_stats.read().unwrap();
 
-            println!(
-                "heap size: {} bytes, time: {}",
-                new_heap_size,
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
-            );
+            log::debug!("heap size: {} bytes", new_heap_size);
 
             // dump every 75MB
             if (last_peak_size > 0
@@ -1303,10 +1693,9 @@ fn memory_monitor(_force_dump: Arc<AtomicBool>) {
                 && new_heap_size - last_peak_size > 10 * 1024 * 1024)
                 || _force_dump.load(std::sync::atomic::Ordering::Relaxed)
             {
-                println!(
-                    "heap size increased: {} bytes, time: {}",
+                log::debug!(
+                    "heap size increased: {} bytes",
                     new_heap_size - last_peak_size,
-                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
                 );
                 dump_profile(new_heap_size);
                 last_peak_size = new_heap_size;
@@ -1370,14 +1759,19 @@ pub async fn main() -> ExitCode {
 
     if let Some(shell) = cli.gen_autocomplete {
         let mut cmd = Cli::command();
-        crate::print_completions(shell, &mut cmd, "easytier-core");
+        if let Some(shell) = shell.to_shell() {
+            crate::print_completions(shell, &mut cmd, "easytier-core");
+        } else {
+            // Handle Nushell
+            crate::print_nushell_completions(&mut cmd, "easytier-core");
+        }
         return ExitCode::SUCCESS;
     }
 
     // Verify configurations
     if cli.check_config {
-        if let Err(e) = validate_config(&cli).await {
-            eprintln!("Config validation failed: {:?}", e);
+        if let Err(error) = validate_config(&cli).await {
+            log::error!(%error, "Config validation failed");
             return ExitCode::FAILURE;
         } else {
             return ExitCode::SUCCESS;
@@ -1386,12 +1780,12 @@ pub async fn main() -> ExitCode {
 
     let mut ret_code = 0;
 
-    if let Err(e) = run_main(cli).await {
-        eprintln!("error: {:?}", e);
+    if let Err(error) = run_main(cli).await {
+        log::error!(%error);
         ret_code = 1;
     }
 
-    println!("Stopping easytier...");
+    log::info!("Stopping easytier...");
     set_prof_active(false);
 
     ExitCode::from(ret_code)
@@ -1407,14 +1801,358 @@ async fn validate_config(cli: &Cli) -> anyhow::Result<()> {
     for config_file in config_files {
         if config_file == &PathBuf::from("-") {
             let mut stdin = String::new();
-            _ = tokio::io::stdin().read_to_string(&mut stdin).await?;
-            TomlConfigLoader::new_from_str(stdin.as_str())
-                .with_context(|| "config source: stdin")?;
+            _ = tokio::io::stdin()
+                .read_to_string(&mut stdin)
+                .await
+                .context("failed to read config from stdin")?;
+            TomlConfigLoader::new_from_str_with_source("stdin", stdin.as_str())?;
         } else {
-            TomlConfigLoader::new(config_file)
-                .with_context(|| format!("config source: {:?}", config_file))?;
+            load_toml_config_from_path(config_file)?;
         };
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_listeners() {
+        type IpSchemeMap = fn(&IpScheme) -> String;
+
+        let cases: [(&str, IpSchemeMap); _] = [
+            ("0", |s| format!("{}://0.0.0.0:0", s)),
+            ("11010", |s| {
+                format!("{}://0.0.0.0:{}", s, 11010 + s.port_offset())
+            }),
+            ("1.1.1.1", |s| {
+                format!("{}://1.1.1.1:{}", s, 11010 + s.port_offset())
+            }),
+            ("1.1.1.1:50000", |s| {
+                format!("{}://1.1.1.1:{}", s, 50000 + s.port_offset())
+            }),
+            ("[::1]", |s| {
+                format!("{}://[::1]:{}", s, 11010 + s.port_offset())
+            }),
+            ("[::1]:50000", |s| {
+                format!("{}://[::1]:{}", s, 50000 + s.port_offset())
+            }),
+        ];
+
+        for (input, output) in cases {
+            assert_eq!(
+                Cli::parse_listeners(false, vec![input.to_string()]).unwrap(),
+                IpScheme::VARIANTS.iter().map(output).collect::<Vec<_>>()
+            );
+        }
+
+        let input = cases.iter().map(|(i, _)| i.to_string()).collect::<Vec<_>>();
+        let output = cases
+            .iter()
+            .flat_map(|(_, o)| IpScheme::VARIANTS.iter().map(o))
+            .collect::<Vec<_>>();
+        assert_eq!(Cli::parse_listeners(false, input).unwrap(), output);
+
+        let cases: [(IpSchemeMap, IpSchemeMap); _] = [
+            (
+                |s| format!("{}", s),
+                |s| format!("{}://0.0.0.0:{}", s, 11010 + s.port_offset()),
+            ),
+            (
+                |s| format!("{}:50000", s),
+                |s| format!("{}://0.0.0.0:50000", s),
+            ),
+            (
+                |s| format!("{}://1.1.1.1:50000", s),
+                |s| format!("{}://1.1.1.1:50000", s),
+            ),
+        ];
+
+        for (input, output) in cases {
+            assert_eq!(
+                Cli::parse_listeners(
+                    false,
+                    IpScheme::VARIANTS.iter().map(input).collect::<Vec<_>>(),
+                )
+                .unwrap(),
+                IpScheme::VARIANTS.iter().map(output).collect::<Vec<_>>()
+            );
+        }
+
+        let input = cases
+            .iter()
+            .flat_map(|(i, _)| IpScheme::VARIANTS.iter().map(i))
+            .collect::<Vec<_>>();
+        let output = cases
+            .iter()
+            .flat_map(|(_, o)| IpScheme::VARIANTS.iter().map(o))
+            .collect::<Vec<_>>();
+        assert_eq!(Cli::parse_listeners(false, input).unwrap(), output);
+
+        let cases = ["tcp://[::1", "xxx", "tcp:/abc", "tcp:abc"];
+        for input in cases {
+            assert!(
+                Cli::parse_listeners(false, vec![input.to_string()]).is_err(),
+                "input: {}",
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn test_network_options_merge_preserves_credential_identity() {
+        let cfg = TomlConfigLoader::new_from_str(
+            r#"
+[network_identity]
+network_name = "credential-network"
+network_secret = ""
+
+[secure_mode]
+enabled = true
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.get_network_identity().network_secret, None);
+
+        NetworkOptions {
+            hostname: Some("override-host".to_string()),
+            ..Default::default()
+        }
+        .merge_into(&cfg)
+        .unwrap();
+
+        let identity = cfg.get_network_identity();
+        assert_eq!(identity.network_name, "credential-network");
+        assert_eq!(identity.network_secret, None);
+        assert_eq!(identity.network_secret_digest, None);
+        assert_eq!(cfg.get_hostname(), "override-host");
+    }
+
+    #[test]
+    fn secure_mode_cli_flag_preserves_config_file_keypair() {
+        use base64::{Engine as _, prelude::BASE64_STANDARD};
+        let private = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let cfg = TomlConfigLoader::new_from_str(&format!(
+            r#"
+[secure_mode]
+enabled = true
+local_private_key = "{}"
+"#,
+            BASE64_STANDARD.encode(private.as_bytes())
+        ))
+        .unwrap();
+        let file_keypair = cfg.get_secure_mode().unwrap();
+
+        NetworkOptions {
+            secure_mode: Some(true),
+            ..Default::default()
+        }
+        .merge_into(&cfg)
+        .unwrap();
+
+        let merged = cfg.get_secure_mode().unwrap();
+        assert!(merged.enabled);
+        assert_eq!(merged.local_private_key, file_keypair.local_private_key);
+        assert_eq!(merged.local_public_key, file_keypair.local_public_key);
+        assert_eq!(merged.private_key().unwrap().as_bytes(), private.as_bytes());
+    }
+
+    #[test]
+    fn secure_mode_cli_key_replaces_config_file_keypair() {
+        use base64::{Engine as _, prelude::BASE64_STANDARD};
+        let cfg = TomlConfigLoader::new_from_str(
+            r#"
+[secure_mode]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let cli_private = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+
+        NetworkOptions {
+            secure_mode: Some(true),
+            local_private_key: Some(BASE64_STANDARD.encode(cli_private.as_bytes())),
+            ..Default::default()
+        }
+        .merge_into(&cfg)
+        .unwrap();
+
+        let merged = cfg.get_secure_mode().unwrap();
+        assert_eq!(
+            merged.private_key().unwrap().as_bytes(),
+            cli_private.as_bytes()
+        );
+        assert_eq!(
+            merged.public_key().unwrap().as_bytes(),
+            x25519_dalek::PublicKey::from(&cli_private).as_bytes()
+        );
+    }
+
+    #[test]
+    fn empty_stun_server_options_clear_existing_config() {
+        let cfg = TomlConfigLoader::new_from_str(
+            r#"
+stun_servers = ["udp.example.com:3478"]
+stun_servers_v6 = ["v6.example.com:3478"]
+tcp_stun_servers = ["tcp.example.com:3478"]
+"#,
+        )
+        .unwrap();
+
+        NetworkOptions {
+            stun_servers: Some(Vec::new()),
+            stun_servers_v6: Some(Vec::new()),
+            tcp_stun_servers: Some(Vec::new()),
+            ..Default::default()
+        }
+        .merge_into(&cfg)
+        .unwrap();
+
+        assert_eq!(cfg.get_stun_servers(), Some(Vec::new()));
+        assert_eq!(cfg.get_stun_servers_v6(), Some(Vec::new()));
+        assert_eq!(cfg.get_tcp_stun_servers(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn vpn_portal_cli_uses_named_clients_and_preserves_unset_fields() {
+        let cfg = TomlConfigLoader::new_from_str(
+            r#"
+[vpn_portal_config]
+wireguard_listen = "127.0.0.1:51820"
+wireguard_private_key = "existing-key"
+
+[[vpn_portal_config.clients]]
+name = "existing"
+virtual_ip = "10.144.144.9/24"
+"#,
+        )
+        .unwrap();
+
+        NetworkOptions {
+            vpn_portal: Some("wg://0.0.0.0:51821".to_owned()),
+            ..Default::default()
+        }
+        .merge_into(&cfg)
+        .unwrap();
+        let preserved = cfg.get_vpn_portal_config().unwrap();
+        assert_eq!(preserved.wireguard_listen, "0.0.0.0:51821".parse().unwrap());
+        assert_eq!(
+            preserved.wireguard_private_key.as_deref(),
+            Some("existing-key")
+        );
+        assert_eq!(preserved.clients[0].name, "existing");
+
+        NetworkOptions {
+            vpn_portal_private_key: Some("replacement-key".to_owned()),
+            vpn_portal_clients: vec![
+                "alice=10.144.144.10/24".to_owned(),
+                "bob=10.144.144.11/24".to_owned(),
+            ],
+            vpn_portal_client_groups: vec!["alice=staff".to_owned(), "alice=dev".to_owned()],
+            ..Default::default()
+        }
+        .merge_into(&cfg)
+        .unwrap();
+
+        let replaced = cfg.get_vpn_portal_config().unwrap();
+        assert_eq!(replaced.wireguard_listen, "0.0.0.0:51821".parse().unwrap());
+        assert_eq!(
+            replaced.wireguard_private_key.as_deref(),
+            Some("replacement-key")
+        );
+        assert_eq!(
+            replaced
+                .clients
+                .iter()
+                .map(|client| client.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alice", "bob"]
+        );
+        assert_eq!(
+            replaced.clients[0].groups,
+            vec!["staff".to_owned(), "dev".to_owned()]
+        );
+        assert!(replaced.clients[1].groups.is_empty());
+    }
+
+    #[test]
+    fn vpn_portal_cli_rejects_legacy_path_and_invalid_group_mapping() {
+        let error = NetworkOptions::parse_vpn_portal_listener("wg://0.0.0.0:51820/10.14.14.0/24")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("legacy VPN portal CIDR"), "{error}");
+
+        let cfg = TomlConfigLoader::default();
+        let missing_clients = NetworkOptions {
+            vpn_portal: Some("wg://0.0.0.0:51820".to_owned()),
+            vpn_portal_client_groups: vec!["alice=staff".to_owned()],
+            ..Default::default()
+        }
+        .merge_into(&cfg)
+        .unwrap_err()
+        .to_string();
+        assert!(
+            missing_clients.contains("requires at least one --vpn-portal-client"),
+            "{missing_clients}"
+        );
+
+        let unknown_client = NetworkOptions {
+            vpn_portal: Some("wg://0.0.0.0:51820".to_owned()),
+            vpn_portal_clients: vec!["alice=10.144.144.10/24".to_owned()],
+            vpn_portal_client_groups: vec!["bob=staff".to_owned()],
+            ..Default::default()
+        }
+        .merge_into(&TomlConfigLoader::default())
+        .unwrap_err()
+        .to_string();
+        assert!(
+            unknown_client.contains("unknown CLI client: bob"),
+            "{unknown_client}"
+        );
+
+        let bare_ip = NetworkOptions {
+            vpn_portal_clients: vec!["alice=10.144.144.10".to_owned()],
+            ..Default::default()
+        }
+        .parse_vpn_portal_clients()
+        .unwrap_err()
+        .to_string();
+        assert!(bare_ip.contains("expected NAME=CIDR"), "{bare_ip}");
+    }
+
+    #[test]
+    fn vpn_portal_cli_repeat_flags_use_singular_names() {
+        let cli = Cli::try_parse_from([
+            "easytier-core",
+            "--vpn-portal",
+            "wg://0.0.0.0:51820",
+            "--vpn-portal-private-key",
+            "private-key",
+            "--vpn-portal-client",
+            "alice=10.144.144.10",
+            "--vpn-portal-client",
+            "bob=10.144.144.11",
+            "--vpn-portal-client-group",
+            "alice=staff",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cli.network_options.vpn_portal_clients,
+            vec![
+                "alice=10.144.144.10".to_owned(),
+                "bob=10.144.144.11".to_owned()
+            ]
+        );
+        assert_eq!(
+            cli.network_options.vpn_portal_client_groups,
+            vec!["alice=staff".to_owned()]
+        );
+        assert_eq!(
+            cli.network_options.vpn_portal_private_key.as_deref(),
+            Some("private-key")
+        );
+    }
 }

@@ -19,6 +19,58 @@ Default permissions for the plugin
 <tr>
 <td>
 
+`vpnservice:allow-consume-vpn-tile-action`
+
+</td>
+<td>
+
+Enables the consume_vpn_tile_action command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`vpnservice:deny-consume-vpn-tile-action`
+
+</td>
+<td>
+
+Denies the consume_vpn_tile_action command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`vpnservice:allow-get-vpn-status`
+
+</td>
+<td>
+
+Enables the get_vpn_status command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`vpnservice:deny-get-vpn-status`
+
+</td>
+<td>
+
+Denies the get_vpn_status command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `vpnservice:allow-ping`
 
 </td>

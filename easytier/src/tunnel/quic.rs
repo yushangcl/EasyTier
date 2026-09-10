@@ -2,137 +2,321 @@
 //!
 //! Checkout the `README.md` for guidance.
 
-use std::{
-    error::Error, io::IoSliceMut, net::SocketAddr, pin::Pin, sync::Arc, task::Poll, time::Duration,
-};
-
-use crate::tunnel::{
-    common::{setup_sokcet2, FramedReader, FramedWriter, TunnelWrapper},
-    TunnelInfo,
-};
+use crate::proto::common::TunnelInfo;
 use anyhow::Context;
-
+use easytier_core::{
+    connectivity::{
+        protocol::{ServerProtocolAdmission, ServerTunnelAcceptor},
+        transport::ConnectedUdpSession,
+    },
+    socket::udp::UdpSession,
+    tunnel::{
+        Tunnel, TunnelError,
+        framed::{FramedReader, FramedWriter},
+        wrapper::TunnelWrapper,
+    },
+};
 use quinn::{
-    congestion::BbrConfig, crypto::rustls::QuicClientConfig, udp::RecvMeta, AsyncUdpSocket,
-    ClientConfig, Connection, Endpoint, EndpointConfig, ServerConfig, TransportConfig, UdpPoller,
+    AsyncUdpSocket, ClientConfig, Connecting, Connection, Endpoint, EndpointConfig, Incoming,
+    ServerConfig, TransportConfig, congestion::BbrConfig, default_runtime,
 };
-
-use super::{
-    check_scheme_and_get_socket_addr,
-    insecure_tls::{get_insecure_tls_cert, get_insecure_tls_client_config},
-    IpVersion, Tunnel, TunnelConnector, TunnelError, TunnelListener,
+use std::{net::SocketAddr, sync::Arc, time::Duration};
+use tokio::{
+    sync::{
+        OwnedSemaphorePermit, Semaphore,
+        mpsc::{Receiver, Sender, channel},
+    },
+    task::JoinSet,
 };
+use tokio_util::task::AbortOnDropHandle;
 
-pub fn configure_client() -> ClientConfig {
-    let client_crypto = QuicClientConfig::try_from(get_insecure_tls_client_config()).unwrap();
-    let mut client_config = ClientConfig::new(Arc::new(client_crypto));
+mod session_socket;
+pub(crate) use session_socket::QuicUdpSessionSocket;
 
-    // // Create a new TransportConfig and set BBR
-    let mut transport_config = TransportConfig::default();
-    transport_config.congestion_controller_factory(Arc::new(BbrConfig::default()));
-    transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
-    // Replace the default TransportConfig with the transport_config() method
-    client_config.transport_config(Arc::new(transport_config));
-
-    client_config
-}
-
-#[derive(Clone, Debug)]
-struct NoGroAsyncUdpSocket {
-    inner: Arc<dyn AsyncUdpSocket>,
-}
-
-impl AsyncUdpSocket for NoGroAsyncUdpSocket {
-    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
-        self.inner.clone().create_io_poller()
-    }
-
-    fn try_send(&self, transmit: &quinn::udp::Transmit) -> std::io::Result<()> {
-        self.inner.try_send(transmit)
-    }
-
-    /// Receive UDP datagrams, or register to be woken if receiving may succeed in the future
-    fn poll_recv(
-        &self,
-        cx: &mut std::task::Context,
-        bufs: &mut [IoSliceMut<'_>],
-        meta: &mut [RecvMeta],
-    ) -> Poll<std::io::Result<usize>> {
-        self.inner.poll_recv(cx, bufs, meta)
-    }
-
-    /// Look up the local IP address and port used by this socket
-    fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.inner.local_addr()
-    }
-
-    fn may_fragment(&self) -> bool {
-        self.inner.may_fragment()
-    }
-
-    fn max_transmit_segments(&self) -> usize {
-        self.inner.max_transmit_segments()
-    }
-
-    fn max_receive_segments(&self) -> usize {
-        1
-    }
-}
-
-/// Constructs a QUIC endpoint configured to listen for incoming connections on a certain address
-/// and port.
-///
-/// ## Returns
-///
-/// - a stream of incoming QUIC connections
-/// - server certificate serialized into DER format
-#[allow(unused)]
-pub fn make_server_endpoint(bind_addr: SocketAddr) -> Result<(Endpoint, Vec<u8>), Box<dyn Error>> {
-    let (server_config, server_cert) = configure_server()?;
-
-    let socket2_socket = socket2::Socket::new(
-        socket2::Domain::for_address(bind_addr),
-        socket2::Type::DGRAM,
-        Some(socket2::Protocol::UDP),
-    )?;
-    setup_sokcet2(&socket2_socket, &bind_addr)?;
-    let socket = std::net::UdpSocket::from(socket2_socket);
-
-    let runtime =
-        quinn::default_runtime().ok_or_else(|| std::io::Error::other("no async runtime found"))?;
-    let mut endpoint_config = EndpointConfig::default();
-    endpoint_config.max_udp_payload_size(1200)?;
-    let socket: NoGroAsyncUdpSocket = NoGroAsyncUdpSocket {
-        inner: runtime.wrap_udp_socket(socket)?,
+// region config
+mod crypto {
+    use crate::utils::BoxExt;
+    use bytes::{Buf, BytesMut};
+    use quinn_proto::crypto::{
+        ClientConfig, ExportKeyingMaterialError, KeyPair, Keys, ServerConfig, Session,
+        UnsupportedVersion,
     };
-    let endpoint = Endpoint::new_with_abstract_socket(
-        endpoint_config,
-        Some(server_config),
-        Arc::new(socket),
-        runtime,
-    )?;
-    Ok((endpoint, server_cert))
+    use quinn_proto::transport_parameters::TransportParameters;
+    use quinn_proto::{
+        ConnectError, ConnectionId, Side, TransportError,
+        crypto::{CryptoError, HeaderKey, PacketKey},
+    };
+    use seahash::SeaHasher;
+    use std::any::Any;
+    use std::{hash::Hasher, sync::Arc};
+    use tracing::{error, instrument, trace};
+
+    #[derive(Debug, Clone, Copy)]
+    struct CryptoKey;
+
+    impl CryptoKey {
+        fn header(self) -> KeyPair<Box<dyn HeaderKey>> {
+            KeyPair {
+                local: Box::new(self),
+                remote: Box::new(self),
+            }
+        }
+
+        fn packet(self) -> KeyPair<Box<dyn PacketKey>> {
+            KeyPair {
+                local: Box::new(self),
+                remote: Box::new(self),
+            }
+        }
+
+        fn keys(self) -> Keys {
+            Keys {
+                header: self.header(),
+                packet: self.packet(),
+            }
+        }
+    }
+
+    impl HeaderKey for CryptoKey {
+        fn decrypt(&self, _: usize, _: &mut [u8]) {}
+        fn encrypt(&self, _: usize, _: &mut [u8]) {}
+        fn sample_size(&self) -> usize {
+            0
+        }
+    }
+
+    impl CryptoKey {
+        fn checksum(slices: &[&[u8]]) -> u64 {
+            let mut hasher = SeaHasher::default();
+            for slice in slices {
+                hasher.write(&(slice.len() as u64).to_le_bytes());
+                hasher.write(slice);
+            }
+            hasher.finish()
+        }
+    }
+
+    impl PacketKey for CryptoKey {
+        #[instrument(level = "trace")]
+        fn encrypt(&self, packet: u64, buf: &mut [u8], header_len: usize) {
+            let (header, rest) = buf.split_at_mut(header_len);
+            let (payload, tag) = rest.split_at_mut(rest.len() - self.tag_len());
+            let checksum = Self::checksum(&[header, payload]);
+            tag.copy_from_slice(&checksum.to_be_bytes());
+            trace!(checksum, ?header, ?payload, ?tag);
+        }
+
+        #[instrument(level = "trace")]
+        fn decrypt(
+            &self,
+            packet: u64,
+            header: &[u8],
+            payload: &mut BytesMut,
+        ) -> Result<(), CryptoError> {
+            let tag = payload.split_off(payload.len() - self.tag_len()).get_u64();
+            trace!(tag, ?payload);
+            let checksum = Self::checksum(&[header, payload]);
+            if checksum != tag {
+                error!(tag, checksum, "checksum mismatch");
+                return Err(CryptoError);
+            }
+            Ok(())
+        }
+
+        fn tag_len(&self) -> usize {
+            8
+        }
+
+        fn confidentiality_limit(&self) -> u64 {
+            u64::MAX
+        }
+
+        fn integrity_limit(&self) -> u64 {
+            1 << 36
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum HandshakeState {
+        EmitInitial,
+        EmitHandshake,
+        Done,
+    }
+
+    #[derive(Debug)]
+    struct QuicSession {
+        side: Side,
+        state: HandshakeState,
+        local: TransportParameters,
+        remote: Option<TransportParameters>,
+    }
+
+    impl QuicSession {
+        fn new(side: Side, params: TransportParameters) -> Self {
+            Self {
+                side,
+                state: HandshakeState::EmitInitial,
+                local: params,
+                remote: None,
+            }
+        }
+    }
+
+    impl Session for QuicSession {
+        fn initial_keys(&self, _: &ConnectionId, _: Side) -> Keys {
+            CryptoKey.keys()
+        }
+
+        fn handshake_data(&self) -> Option<Box<dyn Any>> {
+            self.remote.map(|params| params.boxed() as _)
+        }
+
+        fn peer_identity(&self) -> Option<Box<dyn Any>> {
+            None
+        }
+
+        fn early_crypto(&self) -> Option<(Box<dyn HeaderKey>, Box<dyn PacketKey>)> {
+            None
+        }
+
+        fn early_data_accepted(&self) -> Option<bool> {
+            Some(false)
+        }
+
+        #[instrument(level = "trace")]
+        fn is_handshaking(&self) -> bool {
+            self.remote.is_none() || self.state != HandshakeState::Done
+        }
+
+        #[instrument(level = "trace")]
+        fn read_handshake(&mut self, mut buf: &[u8]) -> Result<bool, TransportError> {
+            if self.remote.is_none() {
+                self.remote = Some(
+                    TransportParameters::read(self.side, &mut buf)
+                        .expect("failed to read transport parameters"),
+                );
+            }
+            Ok(true)
+        }
+
+        #[instrument(level = "trace")]
+        fn transport_parameters(&self) -> Result<Option<TransportParameters>, TransportError> {
+            Ok(self.remote)
+        }
+
+        #[instrument(level = "trace")]
+        fn write_handshake(&mut self, buf: &mut Vec<u8>) -> Option<Keys> {
+            match self.state {
+                HandshakeState::EmitInitial => {
+                    if self.side.is_client() {
+                        self.local.write(buf);
+                    }
+                    self.state = HandshakeState::EmitHandshake;
+                    Some(CryptoKey.keys())
+                }
+                HandshakeState::EmitHandshake => {
+                    if self.side.is_server() {
+                        self.local.write(buf);
+                    }
+                    self.state = HandshakeState::Done;
+                    Some(CryptoKey.keys())
+                }
+                HandshakeState::Done => None,
+            }
+        }
+
+        fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn PacketKey>>> {
+            Some(CryptoKey.packet())
+        }
+
+        fn is_valid_retry(&self, _: &ConnectionId, _: &[u8], _: &[u8]) -> bool {
+            true
+        }
+
+        fn export_keying_material(
+            &self,
+            _: &mut [u8],
+            _: &[u8],
+            _: &[u8],
+        ) -> Result<(), ExportKeyingMaterialError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct CryptoConfig;
+
+    impl ClientConfig for CryptoConfig {
+        #[instrument(level = "trace")]
+        fn start_session(
+            self: Arc<Self>,
+            version: u32,
+            server_name: &str,
+            params: &TransportParameters,
+        ) -> Result<Box<dyn Session>, ConnectError> {
+            Ok(Box::new(QuicSession::new(Side::Client, *params)))
+        }
+    }
+
+    impl ServerConfig for CryptoConfig {
+        fn initial_keys(&self, _: u32, _: &ConnectionId) -> Result<Keys, UnsupportedVersion> {
+            Ok(CryptoKey.keys())
+        }
+
+        fn retry_tag(&self, _: u32, _: &ConnectionId, _: &[u8]) -> [u8; 16] {
+            [0u8; 16]
+        }
+
+        #[instrument(level = "trace")]
+        fn start_session(
+            self: Arc<Self>,
+            version: u32,
+            params: &TransportParameters,
+        ) -> Box<dyn Session> {
+            Box::new(QuicSession::new(Side::Server, *params))
+        }
+    }
 }
 
-/// Returns default server configuration along with its certificate.
-pub fn configure_server() -> Result<(ServerConfig, Vec<u8>), Box<dyn Error>> {
-    let (certs, key) = get_insecure_tls_cert();
+pub fn transport_config() -> Arc<TransportConfig> {
+    let mut config = TransportConfig::default();
 
-    let mut server_config = ServerConfig::with_single_cert(certs.clone(), key)?;
-    let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
-    transport_config.max_concurrent_uni_streams(10_u8.into());
-    transport_config.max_concurrent_bidi_streams(10_u8.into());
-    // Setting BBR congestion control
-    transport_config.congestion_controller_factory(Arc::new(BbrConfig::default()));
+    config
+        .max_concurrent_bidi_streams(u8::MAX.into())
+        .max_concurrent_uni_streams(0u8.into())
+        .keep_alive_interval(Some(Duration::from_secs(5)))
+        .initial_mtu(1200)
+        .min_mtu(1200)
+        .enable_segmentation_offload(true)
+        .congestion_controller_factory(Arc::new(BbrConfig::default()));
 
-    Ok((server_config, certs[0].to_vec()))
+    Arc::new(config)
 }
 
-#[allow(unused)]
-pub const ALPN_QUIC_HTTP: &[&[u8]] = &[b"hq-29"];
+pub fn server_config() -> ServerConfig {
+    let mut config = ServerConfig::with_crypto(Arc::new(crypto::CryptoConfig));
+    config.transport_config(transport_config());
+    config
+}
+
+pub fn client_config() -> ClientConfig {
+    let mut config = ClientConfig::new(Arc::new(crypto::CryptoConfig));
+    config.transport_config(transport_config());
+    config
+}
+
+pub fn endpoint_config() -> EndpointConfig {
+    let mut config = EndpointConfig::default();
+    config.max_udp_payload_size(1200).unwrap();
+    config
+}
+//endregion
+
+const QUIC_ACCEPT_COMPLETION_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct ConnWrapper {
     conn: Connection,
+    _endpoint: Endpoint,
 }
 
 impl Drop for ConnWrapper {
@@ -141,217 +325,349 @@ impl Drop for ConnWrapper {
     }
 }
 
-pub struct QUICTunnelListener {
-    addr: url::Url,
-    endpoint: Option<Endpoint>,
-    server_cert: Option<Vec<u8>>,
+pub(crate) async fn upgrade_connected(
+    connected: ConnectedUdpSession,
+    remote_url: url::Url,
+) -> Result<Box<dyn Tunnel>, TunnelError> {
+    let socket = Arc::new(QuicUdpSessionSocket::new(connected)?);
+    let local_addr = socket.local_addr()?;
+    let remote_addr = socket.peer_addr();
+    let runtime = default_runtime().ok_or(TunnelError::InternalError(
+        "no async runtime found".to_owned(),
+    ))?;
+    let mut endpoint =
+        Endpoint::new_with_abstract_socket(endpoint_config(), None, socket, runtime)?;
+    endpoint.set_default_client_config(client_config());
+    let connecting = endpoint
+        .connect(remote_addr, "localhost")
+        .map_err(anyhow::Error::new)
+        .with_context(|| format!("failed to start connection to {remote_addr}"))?;
+    let connection = connecting
+        .await
+        .with_context(|| format!("failed to connect to {remote_addr}"))?;
+    let (write, read) = connection
+        .open_bi()
+        .await
+        .with_context(|| "open_bi failed")?;
+    let resolved_remote_addr = connection.remote_address();
+    let connection = Arc::new(ConnWrapper {
+        conn: connection,
+        _endpoint: endpoint,
+    });
+    let info = TunnelInfo {
+        tunnel_type: "quic".to_owned(),
+        local_addr: Some(super::build_url_from_socket_addr(&local_addr.to_string(), "quic").into()),
+        remote_addr: Some(remote_url.into()),
+        resolved_remote_addr: Some(
+            super::build_url_from_socket_addr(&resolved_remote_addr.to_string(), "quic").into(),
+        ),
+    };
+    Ok(Box::new(TunnelWrapper::new(
+        FramedReader::new_with_associate_data(read, 4500, Some(Box::new(connection.clone()))),
+        FramedWriter::new_with_associate_data(write, Some(Box::new(connection))),
+        Some(info),
+    )))
 }
 
-impl QUICTunnelListener {
-    pub fn new(addr: url::Url) -> Self {
-        QUICTunnelListener {
-            addr,
-            endpoint: None,
-            server_cert: None,
-        }
-    }
+struct PendingQuicSessionTunnel {
+    connecting: Connecting,
+    endpoint: Endpoint,
+    local_url: url::Url,
+    remote_addr: SocketAddr,
+    _handshake_permit: OwnedSemaphorePermit,
+}
 
-    async fn do_accept(&mut self) -> Result<Box<dyn Tunnel>, super::TunnelError> {
-        // accept a single connection
-        let conn = self
-            .endpoint
-            .as_ref()
-            .unwrap()
-            .accept()
+async fn finish_quic_session_tunnel(
+    pending: PendingQuicSessionTunnel,
+) -> Result<Box<dyn Tunnel>, TunnelError> {
+    let PendingQuicSessionTunnel {
+        connecting,
+        endpoint,
+        local_url,
+        remote_addr,
+        _handshake_permit,
+    } = pending;
+    let connection = tokio::time::timeout(QUIC_ACCEPT_COMPLETION_TIMEOUT, connecting)
+        .await
+        .map_err(TunnelError::Timeout)?
+        .with_context(|| "accept connection failed")?;
+    let (write, read) =
+        tokio::time::timeout(QUIC_ACCEPT_COMPLETION_TIMEOUT, connection.accept_bi())
             .await
-            .ok_or_else(|| anyhow::anyhow!("accept failed, no incoming"))?;
-        let conn = conn.await.with_context(|| "accept connection failed")?;
-        let remote_addr = conn.remote_address();
-        let (w, r) = conn.accept_bi().await.with_context(|| "accept_bi failed")?;
-
-        let arc_conn = Arc::new(ConnWrapper { conn });
-
-        let info = TunnelInfo {
-            tunnel_type: "quic".to_owned(),
-            local_addr: Some(self.local_url().into()),
-            remote_addr: Some(
-                super::build_url_from_socket_addr(&remote_addr.to_string(), "quic").into(),
-            ),
-        };
-
-        Ok(Box::new(TunnelWrapper::new(
-            FramedReader::new_with_associate_data(r, 2000, Some(Box::new(arc_conn.clone()))),
-            FramedWriter::new_with_associate_data(w, Some(Box::new(arc_conn))),
-            Some(info),
-        )))
-    }
+            .map_err(TunnelError::Timeout)?
+            .with_context(|| "accept_bi failed")?;
+    let connection = Arc::new(ConnWrapper {
+        conn: connection,
+        _endpoint: endpoint,
+    });
+    let remote_url = super::build_url_from_socket_addr(&remote_addr.to_string(), "quic");
+    let info = TunnelInfo {
+        tunnel_type: "quic".to_owned(),
+        local_addr: Some(local_url.into()),
+        remote_addr: Some(remote_url.clone().into()),
+        resolved_remote_addr: Some(remote_url.into()),
+    };
+    Ok(Box::new(TunnelWrapper::new(
+        FramedReader::new_with_associate_data(read, 2000, Some(Box::new(connection.clone()))),
+        FramedWriter::new_with_associate_data(write, Some(Box::new(connection))),
+        Some(info),
+    )))
 }
 
-#[async_trait::async_trait]
-impl TunnelListener for QUICTunnelListener {
-    async fn listen(&mut self) -> Result<(), TunnelError> {
-        let addr =
-            check_scheme_and_get_socket_addr::<SocketAddr>(&self.addr, "quic", IpVersion::Both)
-                .await?;
-        let (endpoint, server_cert) = make_server_endpoint(addr)
-            .map_err(|e| anyhow::anyhow!("make server endpoint error: {:?}", e))?;
-        self.endpoint = Some(endpoint);
-        self.server_cert = Some(server_cert);
-
-        self.addr
-            .set_port(Some(self.endpoint.as_ref().unwrap().local_addr()?.port()))
-            .unwrap();
-
-        Ok(())
-    }
-
-    async fn accept(&mut self) -> Result<Box<dyn Tunnel>, super::TunnelError> {
-        loop {
-            match self.do_accept().await {
-                Ok(ret) => return Ok(ret),
-                Err(e) => {
-                    tracing::warn!(?e, "accept fail");
-                    tokio::time::sleep(Duration::from_millis(1)).await;
+async fn run_quic_accepted_session(
+    endpoint: Endpoint,
+    local_url: url::Url,
+    handshakes: Arc<Semaphore>,
+    completed: Sender<Result<Box<dyn Tunnel>, TunnelError>>,
+) {
+    let mut complete_tasks = JoinSet::new();
+    let mut pending_incoming: Option<Incoming> = None;
+    loop {
+        tokio::select! {
+            Some(result) = complete_tasks.join_next(), if !complete_tasks.is_empty() => {
+                let result = match result {
+                    Ok(result) => result,
+                    Err(error) => Err(TunnelError::InternalError(
+                        format!("quic accept task failed: {error}"),
+                    )),
+                };
+                if completed.send(result).await.is_err() {
+                    break;
+                }
+            }
+            incoming = endpoint.accept(), if pending_incoming.is_none() => {
+                match incoming {
+                    Some(incoming) => pending_incoming = Some(incoming),
+                    None => break,
+                }
+            }
+            permit = handshakes.clone().acquire_owned(), if pending_incoming.is_some() => {
+                let Ok(handshake_permit) = permit else {
+                    break;
+                };
+                let incoming = pending_incoming.take().unwrap();
+                let remote_addr = incoming.remote_address();
+                match incoming.accept() {
+                    Ok(connecting) => {
+                        complete_tasks.spawn(finish_quic_session_tunnel(
+                            PendingQuicSessionTunnel {
+                                connecting,
+                                endpoint: endpoint.clone(),
+                                local_url: local_url.clone(),
+                                remote_addr,
+                                _handshake_permit: handshake_permit,
+                            },
+                        ));
+                    }
+                    Err(error) => {
+                        drop(handshake_permit);
+                        if completed
+                            .send(Err(anyhow::Error::new(error)
+                                .context("quic accept connection failed")
+                                .into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                 }
             }
         }
     }
+}
 
-    fn local_url(&self) -> url::Url {
-        self.addr.clone()
+pub(crate) struct QuicAcceptedSession {
+    completed: Receiver<Result<Box<dyn Tunnel>, TunnelError>>,
+    _accept_task: AbortOnDropHandle<()>,
+}
+
+impl QuicAcceptedSession {
+    pub(crate) fn new(
+        session: UdpSession,
+        local_url: url::Url,
+        admission: ServerProtocolAdmission,
+    ) -> Result<Self, TunnelError> {
+        let (active_session, handshake_slots) = admission.into_parts();
+        Self::new_with_admission_parts(session, local_url, active_session, handshake_slots)
     }
-}
 
-pub struct QUICTunnelConnector {
-    addr: url::Url,
-    endpoint: Option<Endpoint>,
-    ip_version: IpVersion,
-}
+    fn new_with_admission_parts(
+        session: UdpSession,
+        local_url: url::Url,
+        active_session: OwnedSemaphorePermit,
+        handshakes: Arc<Semaphore>,
+    ) -> Result<Self, TunnelError> {
+        let socket = Arc::new(QuicUdpSessionSocket::from_accepted(
+            session,
+            active_session,
+        )?);
+        let runtime = default_runtime().ok_or(TunnelError::InternalError(
+            "no async runtime found".to_owned(),
+        ))?;
+        let endpoint = Endpoint::new_with_abstract_socket(
+            endpoint_config(),
+            Some(server_config()),
+            socket,
+            runtime,
+        )?;
+        let (completed_tx, completed) = channel(100);
+        let accept_task = AbortOnDropHandle::new(tokio::spawn(run_quic_accepted_session(
+            endpoint,
+            local_url,
+            handshakes,
+            completed_tx,
+        )));
+        Ok(Self {
+            completed,
+            _accept_task: accept_task,
+        })
+    }
 
-impl QUICTunnelConnector {
-    pub fn new(addr: url::Url) -> Self {
-        QUICTunnelConnector {
-            addr,
-            endpoint: None,
-            ip_version: IpVersion::Both,
+    pub(crate) async fn accept(&mut self) -> Result<Box<dyn Tunnel>, TunnelError> {
+        while let Some(result) = self.completed.recv().await {
+            match result {
+                Ok(tunnel) => return Ok(tunnel),
+                Err(error) => {
+                    tracing::warn!(?error, "QUIC session connection failed");
+                }
+            }
         }
+        Err(TunnelError::Shutdown)
     }
 }
 
 #[async_trait::async_trait]
-impl TunnelConnector for QUICTunnelConnector {
-    async fn connect(&mut self) -> Result<Box<dyn Tunnel>, super::TunnelError> {
-        let addr =
-            check_scheme_and_get_socket_addr::<SocketAddr>(&self.addr, "quic", self.ip_version)
-                .await?;
-        let local_addr = if addr.is_ipv4() {
-            "0.0.0.0:0"
-        } else {
-            "[::]:0"
-        };
-
-        let mut endpoint = Endpoint::client(local_addr.parse().unwrap())?;
-        endpoint.set_default_client_config(configure_client());
-
-        // connect to server
-        let connection = endpoint
-            .connect(addr, "localhost")
-            .unwrap()
-            .await
-            .with_context(|| "connect failed")?;
-        tracing::info!("[client] connected: addr={}", connection.remote_address());
-
-        let local_addr = endpoint.local_addr()?;
-
-        self.endpoint = Some(endpoint);
-
-        let (w, r) = connection
-            .open_bi()
-            .await
-            .with_context(|| "open_bi failed")?;
-
-        let info = TunnelInfo {
-            tunnel_type: "quic".to_owned(),
-            local_addr: Some(
-                super::build_url_from_socket_addr(&local_addr.to_string(), "quic").into(),
-            ),
-            remote_addr: Some(self.addr.clone().into()),
-        };
-
-        let arc_conn = Arc::new(ConnWrapper { conn: connection });
-        Ok(Box::new(TunnelWrapper::new(
-            FramedReader::new_with_associate_data(r, 4500, Some(Box::new(arc_conn.clone()))),
-            FramedWriter::new_with_associate_data(w, Some(Box::new(arc_conn))),
-            Some(info),
-        )))
-    }
-
-    fn remote_url(&self) -> url::Url {
-        self.addr.clone()
-    }
-
-    fn set_ip_version(&mut self, ip_version: IpVersion) {
-        self.ip_version = ip_version;
+impl ServerTunnelAcceptor for QuicAcceptedSession {
+    async fn accept(&mut self) -> anyhow::Result<Box<dyn Tunnel>> {
+        Ok(QuicAcceptedSession::accept(self).await?)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::tunnel::{
-        common::tests::{_tunnel_bench, _tunnel_pingpong},
-        IpVersion,
+    use std::{net::SocketAddr, sync::Arc, time::Duration};
+
+    use easytier_core::{
+        connectivity::{
+            protocol::ServerProtocolAdmissionController,
+            transport::{UdpSessionMode, connect_udp},
+        },
+        packet::ZCPacket,
+        socket::SocketListener,
+        socket::udp::{
+            UdpBindOptions, UdpSessionAcceptKind, UdpSessionListenRequest, UdpSessionProtocol,
+            VirtualUdpSocket,
+        },
+    };
+    use futures::{SinkExt, StreamExt};
+
+    use crate::{
+        common::netns::NetNS, host_runtime::native_host_runtime,
+        socket::udp::new_runtime_udp_session_listener, tunnel::common::tests::_tunnel_echo_server,
     };
 
     use super::*;
 
-    #[tokio::test]
-    async fn quic_pingpong() {
-        let listener = QUICTunnelListener::new("quic://0.0.0.0:21011".parse().unwrap());
-        let connector = QUICTunnelConnector::new("quic://127.0.0.1:21011".parse().unwrap());
-        _tunnel_pingpong(listener, connector).await
-    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accepted_udp_session_supports_multiple_quic_connections() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let mut listener = new_runtime_udp_session_listener(
+                format!("quic://{bind_addr}").parse().unwrap(),
+                UdpSessionListenRequest::new(
+                    UdpBindOptions::port_bound_listener(bind_addr).with_only_v6(false),
+                ),
+                UdpSessionAcceptKind::Classified(UdpSessionProtocol::Quic),
+                NetNS::new(None),
+            );
+            listener.listen().await.unwrap();
+            let remote_addr = listener.bound_socket().unwrap().local_addr().unwrap();
+            let local_url = listener.local_url();
 
-    #[tokio::test]
-    async fn quic_bench() {
-        let listener = QUICTunnelListener::new("quic://0.0.0.0:21012".parse().unwrap());
-        let connector = QUICTunnelConnector::new("quic://127.0.0.1:21012".parse().unwrap());
-        _tunnel_bench(listener, connector).await
-    }
+            let connected = connect_udp(
+                native_host_runtime(),
+                remote_addr,
+                Vec::new(),
+                UdpBindOptions::direct_connect(),
+                UdpSessionMode::Classified(UdpSessionProtocol::Quic),
+            )
+            .await
+            .unwrap();
+            let socket = Arc::new(QuicUdpSessionSocket::new(connected).unwrap());
+            let runtime = default_runtime().unwrap();
+            let mut endpoint =
+                Endpoint::new_with_abstract_socket(endpoint_config(), None, socket, runtime)
+                    .unwrap();
+            endpoint.set_default_client_config(client_config());
 
-    #[tokio::test]
-    async fn ipv6_pingpong() {
-        let listener = QUICTunnelListener::new("quic://[::1]:31015".parse().unwrap());
-        let connector = QUICTunnelConnector::new("quic://[::1]:31015".parse().unwrap());
-        _tunnel_pingpong(listener, connector).await
-    }
+            let server_task = tokio::spawn(async move {
+                let session = listener.accept().await.unwrap();
+                let admission = ServerProtocolAdmissionController::new(1, 2)
+                    .try_admit()
+                    .unwrap();
+                let mut accepted = QuicAcceptedSession::new(session, local_url, admission).unwrap();
+                let first = accepted.accept().await.unwrap();
+                let second = accepted.accept().await.unwrap();
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                        .await
+                        .is_err(),
+                    "both QUIC connections must use the first accepted UDP session"
+                );
+                (first, second)
+            });
 
-    #[tokio::test]
-    async fn ipv6_domain_pingpong() {
-        let listener = QUICTunnelListener::new("quic://[::1]:31016".parse().unwrap());
-        let mut connector =
-            QUICTunnelConnector::new("quic://test.easytier.top:31016".parse().unwrap());
-        connector.set_ip_version(IpVersion::V6);
-        _tunnel_pingpong(listener, connector).await;
+            let first_connection = endpoint
+                .connect(remote_addr, "localhost")
+                .unwrap()
+                .await
+                .unwrap();
+            let (first_write, first_read) = first_connection.open_bi().await.unwrap();
+            let mut first_send = FramedWriter::new(first_write);
+            first_send
+                .send(ZCPacket::new_with_payload(b"first QUIC connection"))
+                .await
+                .unwrap();
+            let second_connection = endpoint
+                .connect(remote_addr, "localhost")
+                .unwrap()
+                .await
+                .unwrap();
+            let (second_write, second_read) = second_connection.open_bi().await.unwrap();
+            let mut second_send = FramedWriter::new(second_write);
+            second_send
+                .send(ZCPacket::new_with_payload(b"second QUIC connection ready"))
+                .await
+                .unwrap();
+            let (first_server, second_server) = server_task.await.unwrap();
 
-        let listener = QUICTunnelListener::new("quic://127.0.0.1:31016".parse().unwrap());
-        let mut connector =
-            QUICTunnelConnector::new("quic://test.easytier.top:31016".parse().unwrap());
-        connector.set_ip_version(IpVersion::V4);
-        _tunnel_pingpong(listener, connector).await;
-    }
+            drop(first_send);
+            drop(first_read);
+            drop(first_server);
+            first_connection.close(0u32.into(), b"first connection done");
 
-    #[tokio::test]
-    async fn test_alloc_port() {
-        // v4
-        let mut listener = QUICTunnelListener::new("quic://0.0.0.0:0".parse().unwrap());
-        listener.listen().await.unwrap();
-        let port = listener.local_url().port().unwrap();
-        assert!(port > 0);
-
-        // v6
-        let mut listener = QUICTunnelListener::new("quic://[::]:0".parse().unwrap());
-        listener.listen().await.unwrap();
-        let port = listener.local_url().port().unwrap();
-        assert!(port > 0);
+            let echo_task = tokio::spawn(_tunnel_echo_server(second_server, false));
+            let mut recv = FramedReader::new(second_read, 4500);
+            let ready = recv.next().await.unwrap().unwrap();
+            assert_eq!(ready.payload(), b"second QUIC connection ready".as_slice());
+            second_send
+                .send(ZCPacket::new_with_payload(
+                    b"second QUIC connection after first closed",
+                ))
+                .await
+                .unwrap();
+            let packet = recv.next().await.unwrap().unwrap();
+            assert_eq!(
+                packet.payload(),
+                b"second QUIC connection after first closed".as_slice()
+            );
+            let _ = second_send.close().await;
+            echo_task.await.unwrap();
+            second_connection.close(0u32.into(), b"second connection done");
+            endpoint.close(0u32.into(), b"test done");
+        })
+        .await
+        .unwrap();
     }
 }
